@@ -28,7 +28,7 @@ test("customer context, first-screen NBA and blocked AI retry", async ({ page })
   await expect(page.getByText("下一最佳动作", { exact: true })).toBeVisible();
   await expect(page.locator(".nba-focus")).toBeInViewport();
   await page.getByRole("button", { name: "AI 重新评估" }).click();
-  await expect(page.getByText(/AI_NOT_CONFIGURED/)).toBeVisible();
+  await expect(page.getByText("AI_NOT_CONFIGURED · 未写入状态", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "返回原筛选" }).click();
   await expect(page).toHaveURL(/owner=.*state=A1/);
 });
