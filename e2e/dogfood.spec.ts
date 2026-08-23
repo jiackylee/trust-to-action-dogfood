@@ -37,7 +37,7 @@ test("customer context, first-screen NBA and blocked AI retry", async ({ page })
   await page.goto("/customers?owner=陈牧&state=A1");
   const firstCustomer = page.locator(".customer-name").first();
   await firstCustomer.click();
-  await expect(page.getByText("下一最佳动作", { exact: true })).toBeVisible();
+  await expect(page.locator(".nba-focus").getByText("下一最佳动作", { exact: true })).toBeVisible();
   await expect(page.locator(".nba-focus")).toBeInViewport();
   await page.getByRole("button", { name: "AI 重新评估" }).click();
   await expect(page.getByText("操作未完成", { exact: true })).toBeVisible();
