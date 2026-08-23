@@ -70,6 +70,8 @@ function makeCustomers(): Customer[] {
         next_review_at: date(25 + (index % 3), 10),
       },
       evaluation_meta: { model: "规则基线 V0.3", response_id: `fixture-${id}`, prompt_version: "fixture-v2" },
+      notes: [],
+      nba_decision: null,
     };
   });
 }
@@ -88,6 +90,7 @@ function makeDrafts(): Draft[] {
     revision: 1,
     updated_at: date(23 - (index % 3), 9 + index),
     title: item[0], stage: item[1], segment: item[2], objective: item[3], body: item[4], cta: item[5], expected_transition: item[6],
+    channel: "朋友圈",
     evidence_refs: [...item[7]], risk_flags: item[8] ? [index === 2 ? "客户证明" : "价格 / Offer"] : [], approval_required: item[8], approval_status: item[9], status: item[10], published_at: null, result: null,
   }));
 }
@@ -105,10 +108,10 @@ function makeProofs(): Proof[] {
 
 function makeApprovals(): Approval[] {
   return [
-    { id: "approval-01", object_id: "draft-03", title: "7 人销售团队如何减少线索遗漏", type: "客户证明 + 量化结果", requester: "林澈", approver: "周岚", status: "pending", summary: "引用 proof-01，包含团队规模与量化结果。", reason: "", due_at: date(23, 18), revision: 1, updated_at: NOW },
-    { id: "approval-02", object_id: "draft-04", title: "Dogfood 试点实施边界", type: "Offer + 价格 / 排期", requester: "林澈", approver: "周岚", status: "returned", summary: "包含排期与实施范围表述。", reason: "缺少已确认的真实容量依据。", due_at: date(23, 12), revision: 2, updated_at: date(22, 17) },
-    { id: "approval-03", object_id: "proof-03", title: "48 小时结果回填机制", type: "量化结果 + 官网使用", requester: "林澈", approver: "周岚", status: "approved", summary: "证据与授权完整。", reason: "必须说明 21 天观察期。", due_at: date(21, 18), revision: 2, updated_at: date(21, 16) },
-    { id: "approval-04", object_id: "proof-04", title: "微信客服匹配失败反馈", type: "客户反馈 + 潜在投诉", requester: "陈牧", approver: "周岚", status: "pending", summary: "当前仅允许内部复盘。", reason: "", due_at: date(24, 10), revision: 1, updated_at: NOW },
+    { id: "approval-01", object_id: "draft-03", object_type: "draft", object_revision: 1, title: "7 人销售团队如何减少线索遗漏", type: "客户证明 + 量化结果", requester: "林澈", approver: "周岚", status: "pending", summary: "引用 proof-01，包含团队规模与量化结果。", risk_flags: ["客户证明 / 量化结果"], evidence_refs: ["proof-01"], reason: "", due_at: date(23, 18), revision: 1, updated_at: NOW },
+    { id: "approval-02", object_id: "draft-04", object_type: "draft", object_revision: 1, title: "Dogfood 试点实施边界", type: "Offer + 价格 / 排期", requester: "林澈", approver: "周岚", status: "returned", summary: "包含排期与实施范围表述。", risk_flags: ["价格 / Offer"], evidence_refs: [], reason: "缺少已确认的真实容量依据。", due_at: date(23, 12), revision: 2, updated_at: date(22, 17) },
+    { id: "approval-03", object_id: "proof-03", object_type: "proof", object_revision: 1, title: "48 小时结果回填机制", type: "量化结果 + 官网使用", requester: "林澈", approver: "周岚", status: "approved", summary: "证据与授权完整。", risk_flags: ["量化结果"], evidence_refs: ["proof-03"], reason: "必须说明 21 天观察期。", due_at: date(21, 18), revision: 2, updated_at: date(21, 16) },
+    { id: "approval-04", object_id: "proof-04", object_type: "proof", object_revision: 1, title: "微信客服匹配失败反馈", type: "客户反馈 + 潜在投诉", requester: "陈牧", approver: "周岚", status: "pending", summary: "当前仅允许内部复盘。", risk_flags: ["投诉 / 敏感信息"], evidence_refs: ["proof-04"], reason: "", due_at: date(24, 10), revision: 1, updated_at: NOW },
   ];
 }
 
@@ -128,7 +131,7 @@ function makeIntegrations(): Integration[] {
 export function createFixtureState(): DomainState {
   const customers = makeCustomers();
   return {
-    fixture_version: 2,
+    fixture_version: 3,
     role: "operations",
     week: 2,
     weekly_plan: {

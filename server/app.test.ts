@@ -56,7 +56,7 @@ describe("AI BFF contracts", () => {
     const manager = createOpenAiServiceManager({ verify });
     const response = await call("/api/v2/ai/config", {
       body: { api_key: secret, model: "gpt-test" },
-      headers: { "x-tta-local-config": "1" },
+      headers: { "x-tta-local-config": "1", "x-tta-role": "operations" },
     }, manager);
     const serialized = await response.text();
 
@@ -75,12 +75,22 @@ describe("AI BFF contracts", () => {
     expect(manager.getConfiguration().source).toBe("none");
   });
 
+  it("rejects AI configuration from the sales role", async () => {
+    const manager = createOpenAiServiceManager({ verify: vi.fn(async () => undefined) });
+    const response = await call("/api/v2/ai/config", {
+      body: { api_key: "role-test-secret-that-is-long-enough", model: "gpt-test" },
+      headers: { "x-tta-local-config": "1", "x-tta-role": "sales" },
+    }, manager);
+    expect(response.status).toBe(403);
+    expect(await response.json()).toMatchObject({ error: { code: "ROLE_FORBIDDEN" } });
+  });
+
   it("preserves the working configuration when candidate validation fails", async () => {
     const verify = vi.fn(async () => { throw new AiServiceError(503, "OPENAI_AUTH_FAILED", "密钥无效", false); });
     const manager = createOpenAiServiceManager({ apiKey: "environment-test-secret-that-is-long-enough", model: "gpt-env", verify });
     const response = await call("/api/v2/ai/config", {
       body: { api_key: "invalid-test-secret-that-is-long-enough", model: "gpt-next" },
-      headers: { "x-tta-local-config": "1" },
+      headers: { "x-tta-local-config": "1", "x-tta-role": "lead" },
     }, manager);
 
     expect(response.status).toBe(503);
@@ -94,7 +104,7 @@ describe("AI BFF contracts", () => {
     await manager.configure("runtime-test-secret-that-is-long-enough", "gpt-runtime");
     const response = await call("/api/v2/ai/config", {
       method: "DELETE",
-      headers: { "x-tta-local-config": "1" },
+      headers: { "x-tta-local-config": "1", "x-tta-role": "operations" },
     }, manager);
 
     expect(response.status).toBe(200);

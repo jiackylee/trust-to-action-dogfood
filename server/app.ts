@@ -74,6 +74,10 @@ function assertLocalConfigurationRequest(request: Request) {
   if (!loopback || request.get("x-tta-local-config") !== "1") {
     throw new AiServiceError(403, "LOCAL_CONFIG_FORBIDDEN", "AI 配置只允许从本机产品界面提交。", false);
   }
+  const role = request.get("x-tta-role");
+  if (role !== "operations" && role !== "lead") {
+    throw new AiServiceError(403, "ROLE_FORBIDDEN", "只有运营或负责人可以修改 AI 配置。", false);
+  }
 }
 
 function createRateLimiter(limit = 20, windowMs = 5 * 60_000) {

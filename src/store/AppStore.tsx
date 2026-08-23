@@ -2,7 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useState, t
 import { aiClient, AiClientError, type AiHealth } from "../data/ai-client";
 import { createDataClient } from "../data/client";
 import type { AiMeta, CustomerEvaluation, WeeklyStrategy } from "../domain/schemas";
-import type { ApiProblem, DomainState, Draft, Role } from "../domain/types";
+import type { ApiProblem, DomainState, Draft, NbaDecision, Proof, ProofCore, Role } from "../domain/types";
 
 const dataClient = createDataClient();
 
@@ -24,9 +24,14 @@ interface StoreValue {
   dismissToast(id: string): void;
   notify(message: Omit<ToastMessage, "id">): void;
   setRole(role: Role): Promise<void>;
-  saveDraft(draft: Draft, expectedRevision: number): Promise<void>;
+  saveDraft(draft: Draft, expectedRevision: number): Promise<Draft>;
+  submitDraftApproval(id: string, expectedRevision: number): Promise<void>;
+  saveProof(proof: Proof, expectedRevision: number): Promise<void>;
+  createProof(proof: Omit<ProofCore, "completeness" | "missing_fields" | "referenced_by">): Promise<void>;
   saveWeeklyStrategy(strategy: WeeklyStrategy, generatedBy: string): Promise<void>;
   applyCustomerEvaluation(customerId: string, evaluation: CustomerEvaluation, meta: AiMeta, expectedRevision: number): Promise<void>;
+  decideNba(customerId: string, decision: NbaDecision["decision"], action: string, reason: string, expectedRevision: number): Promise<void>;
+  addCustomerNote(customerId: string, text: string, expectedRevision: number): Promise<void>;
   decideApproval(id: string, decision: "approved" | "returned", reason: string, expectedRevision: number): Promise<void>;
   recordTaskOutcome(id: string, outcome: string, expectedRevision: number): Promise<void>;
   resetDemo(): Promise<void>;
@@ -87,6 +92,7 @@ export function AppStore({ children }: { children: ReactNode }) {
   async function update(operation: () => Promise<DomainState>) {
     const next = await operation();
     setState(next);
+    return next;
   }
 
   const value = useMemo<StoreValue>(() => ({
@@ -103,13 +109,32 @@ export function AppStore({ children }: { children: ReactNode }) {
       await update(() => dataClient.setRole(role));
     },
     async saveDraft(draft, expectedRevision) {
-      await update(() => dataClient.saveDraft(draft, expectedRevision));
+      const next = await update(() => dataClient.saveDraft(draft, expectedRevision));
+      return next.drafts.find((item) => item.id === draft.id)!;
+    },
+    async submitDraftApproval(id, expectedRevision) {
+      await update(() => dataClient.submitDraftApproval(id, expectedRevision));
+      notify({ title: "已提交负责人审批", detail: "审批已绑定当前内容版本，实质修改后需重新提交。", tone: "success" });
+    },
+    async saveProof(proof, expectedRevision) {
+      await update(() => dataClient.saveProof(proof, expectedRevision));
+    },
+    async createProof(proof) {
+      await update(() => dataClient.createProof(proof));
     },
     async saveWeeklyStrategy(strategy, generatedBy) {
       await update(() => dataClient.saveWeeklyPlan(strategy, generatedBy));
     },
     async applyCustomerEvaluation(customerId, evaluation, meta, expectedRevision) {
       await update(() => dataClient.applyCustomerEvaluation(customerId, evaluation, meta, expectedRevision));
+    },
+    async decideNba(customerId, decision, action, reason, expectedRevision) {
+      await update(() => dataClient.decideNba(customerId, decision, action, reason, expectedRevision));
+      notify({ title: decision === "rejected" ? "建议已拒绝" : "销售任务已建立", detail: decision === "modified" ? "已按修改后的动作进入执行队列。" : undefined, tone: "success" });
+    },
+    async addCustomerNote(customerId, text, expectedRevision) {
+      await update(() => dataClient.addCustomerNote(customerId, text, expectedRevision));
+      notify({ title: "人工笔记已记录", detail: "已写入客户时间线和审计日志。", tone: "success" });
     },
     async decideApproval(id, decision, reason, expectedRevision) {
       const snapshot = state;

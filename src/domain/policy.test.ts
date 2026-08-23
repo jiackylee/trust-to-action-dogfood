@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createFixtureState } from "./fixtures";
-import { can } from "./permissions";
-import { deterministicDraftRisks, validateCustomerEvaluation } from "./policy";
+import { can, canAccessCustomer, canActOnTask } from "./permissions";
+import { deterministicDraftRisks, draftApprovalRisks, proofCompleteness, validateCustomerEvaluation } from "./policy";
 
 describe("customer evaluation policy", () => {
   it("blocks a weak signal from jumping to D1", () => {
@@ -46,5 +46,22 @@ describe("deterministic gates and role permissions", () => {
     expect(can("sales", "record_task")).toBe(true);
     expect(can("lead", "decide_approval")).toBe(true);
     expect(can("operations", "decide_approval")).toBe(false);
+    expect(can("sales", "configure_ai")).toBe(false);
+    expect(can("lead", "configure_ai")).toBe(true);
+  });
+
+  it("limits sales to owned or shared customers and owned tasks", () => {
+    expect(canAccessCustomer("sales", { owner: "陈牧", shared: false })).toBe(true);
+    expect(canAccessCustomer("sales", { owner: "许清", shared: true })).toBe(true);
+    expect(canAccessCustomer("sales", { owner: "许清", shared: false })).toBe(false);
+    expect(canActOnTask("sales", { owner: "陈牧" })).toBe(true);
+    expect(canActOnTask("sales", { owner: "何川" })).toBe(false);
+  });
+
+  it("requires publication-channel authorization and recalculates proof completeness", () => {
+    const state = createFixtureState();
+    const draft = { ...state.drafts[2], channel: "官网" as const };
+    expect(draftApprovalRisks(draft, state.proofs)).toContain("证明未授权用于官网");
+    expect(proofCompleteness({ ...state.proofs[0], baseline: "" })).toMatchObject({ completeness: 86, missing_fields: ["基线"] });
   });
 });

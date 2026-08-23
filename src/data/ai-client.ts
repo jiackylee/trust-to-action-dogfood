@@ -1,5 +1,5 @@
 import type { AiResult, ContentDraftProposal, CustomerEvaluation, RiskReview, WeeklyStrategy } from "../domain/schemas";
-import type { Customer, Draft, Proof } from "../domain/types";
+import type { Customer, Draft, Proof, Role } from "../domain/types";
 
 export class AiClientError extends Error {
   constructor(public code: string, message: string, public retryable: boolean, public requestId: string) {
@@ -51,18 +51,18 @@ export const aiClient = {
     const response = await fetch("/api/v2/health");
     return readResponse<AiHealth>(response);
   },
-  async configure(apiKey: string, model: string) {
+  async configure(apiKey: string, model: string, role: Role) {
     const response = await fetch("/api/v2/ai/config", {
       method: "POST",
-      headers: { "content-type": "application/json", "x-tta-local-config": "1" },
+      headers: { "content-type": "application/json", "x-tta-local-config": "1", "x-tta-role": role },
       body: JSON.stringify({ api_key: apiKey, model }),
     });
     return readResponse<AiConfiguration>(response);
   },
-  async clearRuntimeConfiguration() {
+  async clearRuntimeConfiguration(role: Role) {
     const response = await fetch("/api/v2/ai/config", {
       method: "DELETE",
-      headers: { "x-tta-local-config": "1" },
+      headers: { "x-tta-local-config": "1", "x-tta-role": role },
     });
     return readResponse<AiConfiguration>(response);
   },
