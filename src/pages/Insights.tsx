@@ -1,17 +1,17 @@
 import { useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { ArrowRight, BookOpenCheck, Check, Eye, Filter, MessageSquareText, Sparkles, X } from "lucide-react";
-import { aiClient } from "../data/ai-client";
 import { canViewRawConversation } from "../domain/permissions";
 import { archiveMessageEligibility } from "../domain/policy";
 import type { ContentBrief, ConversationInsight } from "../domain/types";
 import { EvidenceBadge, InlineAlert, LoadingState, Modal, SectionHeader, StatusBadge } from "../components/UI";
 import { useAppStore } from "../store/AppStore";
+import { MarketingDecisionPanel } from "../components/MarketingDecisionPanel";
 
 type DecisionMode = "accepted" | "dismissed";
 
 export function Insights() {
-  const { state, loading, decideInsight, saveBrief, recordRawAccess, explainError, notify } = useAppStore();
+  const { state, loading, decideInsight, generateMarketingCandidate, recordRawAccess, explainError, notify } = useAppStore();
   const [params] = useSearchParams();
   const [status, setStatus] = useState(params.get("status") ?? "all");
   const [category, setCategory] = useState("all");
@@ -66,18 +66,12 @@ export function Insights() {
     if (!briefInsight) return;
     setGenerating(true); setError(null);
     try {
-      const result = await aiClient.contentBrief([briefInsight], currentState.content_outcomes);
       const existing = currentState.content_briefs.find((brief) => brief.insight_ids.includes(briefInsight.id)) ?? currentState.content_briefs.find((brief) => brief.status === "draft");
       if (!existing) throw new Error("NO_BRIEF_SLOT");
-      setBriefCandidate({ ...existing, title: result.data.title, target_segment: result.data.target_segment, stage: result.data.stage, primary_angle: result.data.primary_angle, key_facts: result.data.key_facts, proof_requirements: result.data.proof_requirements, cta: result.data.cta, due_at: result.data.due_at, insight_ids: result.data.insight_refs, ai_meta: result.meta });
+      await generateMarketingCandidate("content_brief", existing.id, existing.revision, `${briefInsight.title} ${briefInsight.customer_segment} 朋友圈内容 Brief 唯一 CTA 证明需求`, { insight_id: briefInsight.id });
+      setBriefCandidate(existing);
     } catch (cause) { setError(explainError(cause)); }
     finally { setGenerating(false); }
-  }
-
-  async function adoptBrief() {
-    if (!briefCandidate) return;
-    try { await saveBrief(briefCandidate, briefCandidate.revision); setBriefInsight(null); setBriefCandidate(null); }
-    catch (cause) { setError(explainError(cause)); }
   }
 
   async function unlockRaw() {
@@ -88,6 +82,8 @@ export function Insights() {
 
   const rawConversation = state.archive_conversations.find((item) => item.id === rawUnlocked);
   const rawMessages = rawConversation ? state.archived_messages.filter((message) => message.conversation_id === rawConversation.id).sort((a, b) => a.seq - b.seq) : [];
+  const activeBrief = briefInsight ? state.content_briefs.find((brief) => brief.insight_ids.includes(briefInsight.id)) ?? null : null;
+  const briefMarketingCandidate = activeBrief ? state.marketing_candidates.find((candidate) => candidate.task_type === "content_brief" && candidate.subject_id === activeBrief.id && candidate.status === "pending") : null;
 
   return <>
     <SectionHeader eyebrow="内容运营输入" title="会话洞察池" description="只分析已同意、有效且脱敏的文本与链接描述。运营看到聚类和脱敏引用，不展示客户原文。" actions={<button className="secondary-button" onClick={() => notify({ title: "分析批次已是最新", detail: `${validMessages} 条消息通过隐私与有效性门禁。`, tone: "info" })}><Sparkles />运行合成分析</button>} />
@@ -134,8 +130,8 @@ export function Insights() {
       {error && <InlineAlert tone="danger" title={error.code}>{error.message}</InlineAlert>}
     </Modal>
 
-    <Modal open={Boolean(briefInsight)} title="内容 Brief" onClose={() => { setBriefInsight(null); setBriefCandidate(null); }} actions={<><button className="secondary-button" onClick={() => void generateBrief()} disabled={generating}><Sparkles />{generating ? "生成中" : "AI 生成候选"}</button><button className="primary-button" onClick={() => void adoptBrief()} disabled={!briefCandidate}>人工采用 Brief</button></>}>
-      {briefCandidate ? <div className="brief-preview"><div><span>目标客户</span><strong>{briefCandidate.target_segment}</strong></div><div><span>阶段</span><strong>{briefCandidate.stage}</strong></div><div className="wide"><span>朋友圈主角度</span><strong>{briefCandidate.primary_angle}</strong></div><div className="wide"><span>关键事实</span><ul>{briefCandidate.key_facts.map((fact) => <li key={fact}>{fact}</li>)}</ul></div><div className="wide"><span>证明需求</span><strong>{briefCandidate.proof_requirements.join("、") || "无额外证明需求"}</strong></div><div><span>唯一 CTA</span><strong>{briefCandidate.cta}</strong></div><div><span>截止时间</span><strong>{new Date(briefCandidate.due_at).toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })}</strong></div></div> : <InlineAlert tone="info" title="尚无 Brief 候选">使用 AI 生成后仍需运营人工采用；无密钥时会明确阻断。</InlineAlert>}
+    <Modal open={Boolean(briefInsight)} title="内容 Brief" onClose={() => { setBriefInsight(null); setBriefCandidate(null); }} actions={<button className="secondary-button" onClick={() => void generateBrief()} disabled={generating}><Sparkles />{generating ? "生成中" : briefMarketingCandidate ? "重新生成候选" : "AI 生成候选"}</button>}>
+      {briefMarketingCandidate && activeBrief ? <MarketingDecisionPanel candidate={briefMarketingCandidate} currentRevision={activeBrief.revision} compact /> : briefCandidate ? <div className="brief-preview"><div><span>目标客户</span><strong>{briefCandidate.target_segment}</strong></div><div><span>阶段</span><strong>{briefCandidate.stage}</strong></div><div className="wide"><span>朋友圈主角度</span><strong>{briefCandidate.primary_angle}</strong></div><div className="wide"><span>关键事实</span><ul>{briefCandidate.key_facts.map((fact) => <li key={fact}>{fact}</li>)}</ul></div><div className="wide"><span>证明需求</span><strong>{briefCandidate.proof_requirements.join("、") || "无额外证明需求"}</strong></div><div><span>唯一 CTA</span><strong>{briefCandidate.cta}</strong></div><div><span>截止时间</span><strong>{new Date(briefCandidate.due_at).toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })}</strong></div></div> : <InlineAlert tone="info" title="尚无 Brief 候选">生成后会保存知识引用和企业事实版本，必须人工判断后才写入 Brief。</InlineAlert>}
       {error && <InlineAlert tone="danger" title={error.code}>{error.message}</InlineAlert>}
     </Modal>
 

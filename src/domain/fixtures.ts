@@ -1,4 +1,4 @@
-import type { AnalysisBatch, Approval, ArchiveConsent, ArchiveConversation, ArchivedMessage, ContentBrief, ContentFamily, ContentOutcome, ConversationInsight, DomainState, Draft, EvalRun, EvaluationCandidate, EvaluationDecision, GenerationRun, GoldenCase, Integration, PromptVersion, Proof, PublicationRecord, RouterVersion, Task } from "./types";
+import type { AnalysisBatch, Approval, ArchiveConsent, ArchiveConversation, ArchivedMessage, ContentBrief, ContentFamily, ContentOutcome, ConversationInsight, DomainState, Draft, EvalRun, EvaluationCandidate, EvaluationDecision, GenerationRun, GoldenCase, Integration, KnowledgePackVersion, KnowledgeRetrievalRun, KnowledgeSource, MarketingBrainVersion, MarketingDecisionCandidate, MarketingDecisionDecision, MarketingDecisionOutput, MarketingTaskType, PromptVersion, Proof, PublicationRecord, RouterVersion, Task, TenantFactVersion } from "./types";
 import type { Customer } from "./types";
 import { STATE_LABELS, type StateCode } from "./schemas";
 import { evidenceFingerprint } from "./quality";
@@ -279,7 +279,7 @@ function makeAnalysisBatches(insights: ConversationInsight[], messages: Archived
 function makeGoldenCases(): GoldenCase[] {
   const stateOrder: StateCode[] = ["T0", "T1", "I1", "D1", "A1", "C1"];
   const actionByState = ["继续观察", "发送知识内容", "分享 Demo", "询问资格问题", "准备 Offer", "转人工"] as const;
-  return Array.from({ length: 200 }, (_, index) => {
+  const nbaCases = Array.from({ length: 200 }, (_, index) => {
     const stateIndex = index % stateOrder.length;
     const stateBefore = stateOrder[stateIndex];
     const anomaly = index % 17 === 0 ? "数据过期" : index % 29 === 0 ? "证据冲突" : null;
@@ -287,11 +287,16 @@ function makeGoldenCases(): GoldenCase[] {
     const canAdvance = !anomaly && evidenceStrength !== "weak" && stateIndex < stateOrder.length - 1;
     const expectedState = canAdvance ? stateOrder[stateIndex + 1] : stateBefore;
     const expectedIndex = stateOrder.indexOf(expectedState);
+    const evidenceId = `gold-evi-${String(index + 1).padStart(3, "0")}`;
+    const expectedEvidenceRefs = stateIndex >= stateOrder.indexOf("D1")
+      ? [evidenceId, `gold-history-${String(index + 1).padStart(3, "0")}`]
+      : [evidenceId];
     return {
       id: `gold-${String(index + 1).padStart(3, "0")}`,
       revision: 1,
       updated_at: NOW,
-      split: index < 160 ? "development" : "holdout",
+      task_type: "customer_nba" as const,
+      split: index < 160 ? "development" as const : "holdout" as const,
       scenario: `${industries[index % industries.length]} · ${stateBefore} · ${evidenceStrength}证据${anomaly ? ` · ${anomaly}` : ""}`,
       industry: industries[index % industries.length],
       state_before: stateBefore,
@@ -299,11 +304,138 @@ function makeGoldenCases(): GoldenCase[] {
       anomaly,
       expected_state: expectedState,
       acceptable_nba: [actionByState[expectedIndex]],
-      expected_evidence_refs: [`gold-evi-${String(index + 1).padStart(3, "0")}`],
-      future_event: index % 13 === 0 ? "quality_reversal" : index % 7 === 0 ? "new_evidence" : "retained",
+      expected_evidence_refs: expectedEvidenceRefs,
+      future_event: index % 13 === 0 ? "quality_reversal" as const : index % 7 === 0 ? "new_evidence" as const : "retained" as const,
       double_reviewed: index % 5 === 0,
+      query: `${industries[index % industries.length]}客户 ${stateBefore} 状态下一最佳动作与跟进证据`,
+      expected_skill_route: ["enterprise-wechat-friend-marketing", "marketing-growth-system"],
+      expected_knowledge_terms: ["证据", "下一动作"],
     };
   });
+  const tasks: Array<{ task: Exclude<MarketingTaskType, "customer_nba">; label: string; terms: string[] }> = [
+    { task: "weekly_strategy", label: "企微周策略", terms: ["窄市场", "实验"] },
+    { task: "content_brief", label: "朋友圈内容 Brief", terms: ["目标客户", "唯一 CTA"] },
+    { task: "content_draft", label: "朋友圈草稿", terms: ["证据", "行动"] },
+  ];
+  const contentCases = tasks.flatMap(({ task, label, terms }, taskIndex) => Array.from({ length: 80 }, (_, index) => {
+    const globalIndex = 200 + taskIndex * 80 + index;
+    const holdout = index >= 64;
+    return {
+      id: `gold-${String(globalIndex + 1).padStart(3, "0")}`, revision: 1, updated_at: NOW, task_type: task,
+      split: holdout ? "holdout" as const : "development" as const,
+      scenario: `${label} · ${industries[index % industries.length]} · ${index % 7 === 0 ? "合规冲突" : "进攻增长"}`,
+      industry: industries[index % industries.length], state_before: stateOrder[index % stateOrder.length], evidence_strength: index % 4 === 0 ? "medium" as const : "strong" as const,
+      anomaly: index % 7 === 0 ? "增长战术与授权门禁冲突" : null, expected_state: stateOrder[index % stateOrder.length], acceptable_nba: ["继续观察" as const],
+      expected_evidence_refs: [`business-${task}-${index + 1}`], future_event: index % 11 === 0 ? "quality_reversal" as const : index % 8 === 0 ? "new_evidence" as const : "retained" as const,
+      double_reviewed: index % 5 === 0, query: `${industries[index % industries.length]} ${label} 企微客户分组 进攻增长 证明门禁`,
+      expected_skill_route: ["enterprise-wechat-friend-marketing", "marketing-growth-system"], expected_knowledge_terms: terms,
+    };
+  }));
+  return [...nbaCases, ...contentCases];
+}
+
+function makeKnowledgeFixtures() {
+  const pack: KnowledgePackVersion = {
+    id: "knowledge-private-demo", revision: 2, updated_at: NOW, name: "private-pack-demo-v2.2", content_hash: "fixture-private-pack-v22",
+    status: "active", source_count: 23, chunk_count: 118, unresolved_count: 2, duplicate_count: 1, indexed_at: date(23, 14), activated_at: date(23, 15), error: null,
+  };
+  const sourceData = [
+    ["source-wechat", "enterprise-wechat-friend-marketing/SKILL.md", "企微好友营销主技能", "enterprise-wechat-friend-marketing", "hard_guardrail", 18],
+    ["source-growth", "marketing-growth-system/SKILL.md", "进攻型增长系统", "marketing-growth-system", "operating_principle", 15],
+    ["source-enterprise", "enterprise-marketing-brain/SKILL.md", "企业营销大脑", "enterprise-marketing-brain", "operating_principle", 12],
+    ["source-global", "global-marketing-brain/SKILL.md", "全球市场营销规则", "global-marketing-brain", "theory", 11],
+    ["source-lifecycle", "企业微信好友全生命周期营销手册.md", "企微全生命周期手册", "enterprise-wechat-friend-marketing", "verified_experience", 20],
+    ["source-framework", "朋友圈特征与IP属性分析及运营框架_第四轮迭代.md", "朋友圈第四轮框架", "enterprise-wechat-friend-marketing", "operating_principle", 14],
+  ] as const;
+  const sources: KnowledgeSource[] = sourceData.map(([id, relative_path, title, skill, knowledge_kind, chunk_count]) => ({
+    id, revision: 1, updated_at: NOW, pack_version_id: pack.id, relative_path, title, skill, version: "2.2", market: skill === "global-marketing-brain" ? ["north_america", "europe"] : ["china"],
+    channels: ["enterprise_wechat"], tasks: ["weekly_strategy", "content_brief", "content_draft", "customer_nba"], lifecycle: ["acquisition", "nurture", "conversion"], stages: ["T", "I", "D", "A"],
+    knowledge_kind, status: "ready", content_hash: `fixture-${id}`, chunk_count, error: null,
+  }));
+  sources.push({ id: "source-unresolved", revision: 1, updated_at: NOW, pack_version_id: pack.id, relative_path: "/external/missing/theory.md", title: "待补理论资料", skill: "marketing-growth-system", version: "unresolved", market: [], channels: [], tasks: [], lifecycle: [], stages: [], knowledge_kind: "theory", status: "unresolved", content_hash: "missing", chunk_count: 0, error: "外部绝对路径不可解析，未进入生成上下文" });
+  const retrievalRuns: KnowledgeRetrievalRun[] = (["weekly_strategy", "content_brief", "content_draft", "customer_nba"] as MarketingTaskType[]).map((task, index) => ({
+    id: `retrieval-demo-${index + 1}`, revision: 1, updated_at: date(23, 14 + index), task_type: task, query: `${task} 企微增长与证据门禁`, filters: { market: ["china"], channels: ["enterprise_wechat"] },
+    skill_route: ["enterprise-wechat-friend-marketing", "marketing-growth-system"], chunk_refs: [`chunk-demo-${index + 1}`], source_refs: [index % 2 ? "source-growth" : "source-wechat"], conflict_count: index === 0 ? 1 : 0,
+    latency_ms: 18 + index * 3, result_count: 6 + index % 2, created_at: date(23, 14 + index),
+  }));
+  const facts: TenantFactVersion[] = [{
+    id: "facts-v2.2-published", revision: 2, updated_at: NOW, name: "企业事实 2026-W34", status: "published", content_hash: "fixture-facts-v22", created_by: "林澈", published_by: "周岚", published_at: date(23, 13),
+    facts: [
+      { id: "fact-product-01", type: "product_truth", title: "产品能力边界", statement: "系统提供可追溯客户状态与下一动作建议，不自动发布、私聊或发送 Offer。", status: "published", markets: ["china"], channels: ["enterprise_wechat"], evidence_refs: [], valid_from: "2026-08-01", expires_at: null },
+      { id: "fact-expert-01", type: "expert_position", title: "专家立场", statement: "增长判断必须回到带时间的客户证据和可执行下一步。", status: "published", markets: ["china"], channels: ["enterprise_wechat"], evidence_refs: [], valid_from: "2026-08-01", expires_at: null },
+      { id: "fact-voice-01", type: "brand_voice", title: "品牌语气", statement: "直接、克制、事实优先，不夸大承诺，不用焦虑驱动成交。", status: "published", markets: ["china"], channels: ["enterprise_wechat"], evidence_refs: [], valid_from: "2026-08-01", expires_at: null },
+      { id: "fact-offer-01", type: "offer_definition", title: "Dogfood Offer", statement: "4 周内部试点，范围和价格在人工诊断后确认。", status: "published", markets: ["china"], channels: ["enterprise_wechat"], evidence_refs: ["proof-01"], valid_from: "2026-08-01", expires_at: "2026-12-31" },
+    ],
+  }];
+  const brains: MarketingBrainVersion[] = [
+    {
+      id: "brain-v2.1-baseline", revision: 2, updated_at: date(10), name: "营销大脑 2.1 基线", status: "archived",
+      prompt_hashes: { weekly_strategy: "legacy-weekly-v21", content_brief: "legacy-brief-v21", content_draft: "legacy-draft-v21", customer_nba: "legacy-nba-v21" },
+      skill_router_version: "skill-router-v2.1", retriever_version: "none", knowledge_pack_version_id: "none", tenant_fact_version_id: facts[0].id,
+      model_router_version_id: "router-v2.0", policy_version: "policy-v2.1", created_by: "系统", published_by: "周岚", published_at: date(10),
+    },
+    {
+      id: "brain-v2.2-published", revision: 2, updated_at: NOW, name: "营销大脑 2.2-RC1", status: "published",
+      prompt_hashes: { weekly_strategy: "prompt-weekly-a91f", content_brief: "prompt-brief-4c23", content_draft: "prompt-draft-18db", customer_nba: "prompt-nba-730a" },
+      skill_router_version: "skill-router-v2.2", retriever_version: "fts5-trigram-v2.2", knowledge_pack_version_id: pack.id, tenant_fact_version_id: facts[0].id,
+      model_router_version_id: "router-v2.1-rc1", policy_version: "policy-v2.2", created_by: "林澈", published_by: "周岚", published_at: NOW,
+    },
+    {
+      id: "brain-v2.2-rc2", revision: 1, updated_at: NOW, name: "营销大脑 2.2-RC2", status: "draft",
+      prompt_hashes: { weekly_strategy: "code-weekly-v22rc2", content_brief: "code-brief-v22rc2", content_draft: "code-draft-v22rc2", customer_nba: "code-nba-v22rc2" },
+      skill_router_version: "skill-router-v2.2", retriever_version: "fts5-trigram-v2.2", knowledge_pack_version_id: pack.id, tenant_fact_version_id: facts[0].id,
+      model_router_version_id: "router-v2.1-rc1", policy_version: "policy-v2.2", created_by: "代码发布流程", published_by: null, published_at: null,
+    },
+  ];
+  return { pack, sources, retrievalRuns, facts, brains };
+}
+
+function makeMarketingDecisionFixtures(customers: Customer[], drafts: Draft[], briefs: ContentBrief[], knowledge: ReturnType<typeof makeKnowledgeFixtures>) {
+  const publishedBrain = knowledge.brains.find((item) => item.status === "published")!;
+  const taskTypes: MarketingTaskType[] = ["weekly_strategy", "content_brief", "content_draft", "customer_nba"];
+  const outputs: Record<MarketingTaskType, MarketingDecisionOutput> = {
+    weekly_strategy: createFixtureStateBaseStrategy(),
+    content_brief: { title: briefs[0].title, target_segment: briefs[0].target_segment, stage: briefs[0].stage, primary_angle: briefs[0].primary_angle, key_facts: briefs[0].key_facts, proof_requirements: briefs[0].proof_requirements, cta: briefs[0].cta, due_at: briefs[0].due_at, insight_refs: briefs[0].insight_ids },
+    content_draft: { title: drafts[0].title, stage: drafts[0].stage, target_segment: drafts[0].segment, objective: drafts[0].objective, body: drafts[0].body, cta: drafts[0].cta, expected_transition: drafts[0].expected_transition, evidence_refs: drafts[0].evidence_refs, risk_flags: drafts[0].risk_flags, approval_required: drafts[0].approval_required },
+    customer_nba: customers[0].evaluation!,
+  };
+  const candidates: MarketingDecisionCandidate[] = [];
+  const decisions: MarketingDecisionDecision[] = [];
+  for (let index = 0; index < 16; index += 1) {
+    const task = taskTypes[index % 4];
+    const subject = task === "customer_nba" ? customers[index % customers.length] : task === "content_draft" ? drafts[index % drafts.length] : task === "content_brief" ? briefs[index % briefs.length] : null;
+    const candidateId = `marketing-candidate-${String(index + 1).padStart(2, "0")}`;
+    const decided = index < 12;
+    const decisionKind = index % 7 === 0 ? "modified" as const : index % 11 === 0 ? "rejected" as const : "accepted" as const;
+    const createdAt = date(15 + (index % 7), 9 + (index % 6));
+    const decisionId = decided ? `marketing-decision-${String(index + 1).padStart(2, "0")}` : null;
+    const output = task === "customer_nba" && subject ? (subject as Customer).evaluation! : outputs[task];
+    const knowledgeRef = { chunk_id: `chunk-demo-${index % 4 + 1}`, source_id: index % 2 ? "source-growth" : "source-wechat", source_title: index % 2 ? "进攻型增长系统" : "企微好友营销主技能", heading_path: ["营销决策", "证据与动作"], knowledge_kind: index % 2 ? "operating_principle" as const : "hard_guardrail" as const, skill: index % 2 ? "marketing-growth-system" : "enterprise-wechat-friend-marketing", version: "2.2", excerpt: "聚焦窄市场，以带时间的有效证据选择下一动作；授权与事实门禁优先。", score: 8.2 };
+    candidates.push({
+      id: candidateId, revision: decided ? 2 : 1, updated_at: createdAt, task_type: task, subject_id: subject?.id ?? "weekly-plan", subject_revision: subject?.revision ?? 1,
+      evidence_fingerprint: `fixture-${task}-${subject?.id ?? "weekly"}`, envelope: { task_type: task, output, business_evidence_refs: task === "customer_nba" ? (output as Customer["evaluation"])!.evidence_refs : ["insight-01", "proof-01"], knowledge_refs: [knowledgeRef],
+        skill_route: ["enterprise-wechat-friend-marketing", "marketing-growth-system"], assumptions: ["本周服务容量维持 3 个诊断名额"], knowledge_conflicts: index % 6 === 0 ? ["进攻频率受当前服务容量门禁约束"] : [],
+        measurement_plan: ["48 小时记录采用结果", "发布后 7 天复查业务结果"], growth_posture: "aggressive", ai_meta: { model: task === "content_draft" && index % 3 === 0 ? "gpt-5.6-terra" : "gpt-5.6", response_id: `resp-marketing-${index + 1}`, prompt_version: `code-${task}-v2.2`, generated_at: createdAt, latency_ms: 4300 + index * 120 },
+        knowledge_pack_version: knowledge.pack.id, tenant_fact_version: knowledge.facts[0].id, marketing_brain_version: publishedBrain.id, prompt_hash: publishedBrain.prompt_hashes[task], input_fingerprint: `input-${index + 1}` },
+      status: decided ? decisionKind : "pending", created_at: createdAt, expires_at: date(28, 18), decided_at: decided ? date(16 + (index % 7), 11) : null, decision_id: decisionId,
+    });
+    if (decided && decisionId) decisions.push({
+      id: decisionId, revision: index < 8 ? 2 : 1, updated_at: date(23, 12), candidate_id: candidateId, task_type: task, subject_id: subject?.id ?? "weekly-plan", decision: decisionKind,
+      original_output: output, final_output: decisionKind === "rejected" ? null : output, reason_code: decisionKind === "accepted" ? null : index % 2 ? "knowledge_not_applicable" : "voice_mismatch",
+      reason_note: decisionKind === "accepted" ? "" : "合成 2.2 盲测反馈", actor: task === "customer_nba" ? "陈牧" : "林澈", decided_at: date(16 + (index % 7), 11), reviewed_within_48h: index % 9 !== 0,
+      review_outcome: index < 8 ? (index === 4 ? "quality_reversal" : index === 5 ? "new_evidence" : "retained") : null, review_reason: index === 4 ? "知识适用范围判断错误" : index === 5 ? "新增业务证据" : "", reviewed_at: index < 8 ? date(23, 11) : null,
+    });
+  }
+  return { candidates, decisions };
+}
+
+function createFixtureStateBaseStrategy() {
+  return {
+    theme: "聚焦跟进失控的 5-10 人企服销售团队", objective: "用高密度证据内容推动有效咨询", target_segments: ["T1 / I1 · 5-10 人企服销售团队"],
+    ratio: { trust: 40, interest: 30, desire: 20, action: 10 }, evidence_gaps: ["同行业授权案例不足"],
+    content_slots: [{ day: "周一", stage: "T" as const, topic: "跟进失控的三个迹象", cta: "领取检查清单" }, { day: "周二", stage: "I" as const, topic: "状态证据看板", cta: "查看 Demo" }, { day: "周四", stage: "D" as const, topic: "7 人团队过程案例", cta: "回复案例" }, { day: "周五", stage: "A" as const, topic: "4 周试点边界", cta: "预约诊断" }],
+    evidence_refs: ["insight-01", "proof-01"], risk_flags: [], next_review_at: date(25, 10),
+  };
 }
 
 function makeQualityFixtures(customers: Customer[]) {
@@ -363,8 +495,8 @@ function makeAiVersions() {
     { id: "router-v2.1-rc1", revision: 1, updated_at: NOW, name: "router-v2.1-risk-first", status: "draft", primary_model: "gpt-5.6", fast_model: "gpt-5.6-terra", confidence_threshold: 75, description: "简单场景走 Terra，高风险直接主模型，只升不降", created_by: "林澈", published_by: null, published_at: null },
   ];
   const evalRuns: EvalRun[] = [{
-    id: "eval-baseline-holdout", revision: 1, updated_at: NOW, prompt_version_id: "prompt-v2.0", router_version_id: "router-v2.0", split: "holdout", status: "completed", case_count: 40,
-    score: { state_accuracy: 77.5, nba_acceptability: 72.5, evidence_precision: 100, policy_violations: 0, privacy_leaks: 0, first_draft_adoption: 55, adoption_improvement_points: 0, critical_slice_regression: 0, p95_latency_ms: 24800, passed: false },
+    id: "eval-baseline-holdout", revision: 1, updated_at: NOW, marketing_brain_version_id: "brain-v2.1-baseline", prompt_version_id: "prompt-v2.0", router_version_id: "router-v2.0", split: "holdout", mode: "replay", status: "completed", case_count: 40,
+    score: { state_accuracy: 77.5, nba_acceptability: 72.5, evidence_precision: 100, policy_violations: 0, privacy_leaks: 0, first_draft_adoption: 55, adoption_improvement_points: 0, critical_slice_regression: 0, p95_latency_ms: 24800, macro_adoption_rate: 55, review_coverage_rate: 80, task_adoption_rates: { weekly_strategy: 56, content_brief: 54, content_draft: 58, customer_nba: 52 }, knowledge_recall_at_5: 72, knowledge_citation_precision: 96, business_evidence_precision: 94, forbidden_source_hits: 0, unsupported_facts: 2, passed: false },
     started_at: date(21, 9), completed_at: date(21, 10), generated_by: "系统盲测",
   }];
   return { prompts, routers, evalRuns };
@@ -378,8 +510,11 @@ export function createFixtureState(): DomainState {
   const publicationHistory = makePublicationHistory();
   const quality = makeQualityFixtures(customers);
   const versions = makeAiVersions();
+  const knowledge = makeKnowledgeFixtures();
+  const drafts = makeDrafts();
+  const marketing = makeMarketingDecisionFixtures(customers, drafts, briefs, knowledge);
   return {
-    fixture_version: 5,
+    fixture_version: 7,
     role: "operations",
     week: 2,
     weekly_plan: {
@@ -404,7 +539,7 @@ export function createFixtureState(): DomainState {
       },
     },
     customers,
-    drafts: makeDrafts(),
+    drafts,
     proofs: makeProofs(),
     approvals: makeApprovals(),
     tasks: makeTasks(customers),
@@ -435,6 +570,13 @@ export function createFixtureState(): DomainState {
     router_versions: versions.routers,
     golden_cases: makeGoldenCases(),
     eval_runs: versions.evalRuns,
+    knowledge_pack_versions: [knowledge.pack],
+    knowledge_sources: knowledge.sources,
+    knowledge_retrieval_runs: knowledge.retrievalRuns,
+    tenant_fact_versions: knowledge.facts,
+    marketing_brain_versions: knowledge.brains,
+    marketing_candidates: marketing.candidates,
+    marketing_decisions: marketing.decisions,
     audits: [
       { id: "audit-01", actor: "系统", action: "生成周策略", detail: "主题：线索跟进不靠销售记忆", at: NOW, source: "system" },
       { id: "audit-02", actor: "林澈", action: "提交敏感审批", detail: "7 人销售团队案例", at: date(23, 11), source: "human" },

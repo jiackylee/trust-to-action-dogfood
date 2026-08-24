@@ -41,12 +41,18 @@ for (const viewport of [{ width: 1440, height: 900 }, { width: 1024, height: 768
     expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1);
     if (viewport.width === 390) {
       await expect(page.locator(".desktop-authoring")).toBeHidden();
-      await expect(page.getByText("Prompt 编辑、黄金集管理和版本对比在桌面端开放；移动端仍可查看质量指标。")).toBeVisible();
+      await expect(page.getByText("营销脑哈希对比、黄金集管理和模型路由编辑在桌面端开放；移动端仍可查看质量指标。")).toBeVisible();
       await page.locator(".role-button").click();
       await page.getByRole("menuitemradio").filter({ hasText: "销售" }).click();
       await page.goto("/customers");
       await page.locator(".customer-cards .mobile-card").first().getByRole("link").click();
       await expect(page.getByRole("button", { name: "原样采用并写入" })).toBeVisible();
+      expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1);
+      await page.locator(".role-button").click();
+      await page.getByRole("menuitemradio").filter({ hasText: "运营" }).click();
+      await page.goto("/content?draft=draft-07");
+      await page.getByRole("button", { name: "审阅 AI 候选" }).click();
+      await expect(page.locator(".marketing-decision-panel")).toContainText("知识依据");
       expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1);
     }
     expect(browserErrors).toEqual([]);
@@ -182,28 +188,54 @@ test("local AI key configuration keeps the secret ephemeral", async ({ page }) =
   await expect(page.getByText(secret, { exact: true })).toHaveCount(0);
 });
 
-test("content operations loop reaches retrospective without automatic sending", async ({ page }) => {
-  await page.route("**/api/v2/ai/content-brief", async (route) => {
-    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({
-      data: { title: "最少字段启动跟进复盘", target_segment: "销售团队", stage: "I", primary_angle: "不用重型改造也能开始", key_facts: ["统一负责人、证据和复查时间"], proof_requirements: [], cta: "回复“清单”", due_at: "2026-08-26T10:00:00+08:00", insight_refs: ["insight-09"] },
-      meta: { model: "mock-openai", response_id: "resp_e2e_brief", prompt_version: "test", generated_at: "2026-08-24T04:00:00.000Z" },
-    }) });
+test("lead must explicitly confirm live Holdout usage", async ({ page }) => {
+  await page.route("**/api/v2/health", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ ok: true, ai_configured: true, knowledge_configured: true, model: "gpt-5.6", fast_model: "gpt-5.6-terra", fast_model_available: true, data_mode: "http-sqlite", session_warning: null, config_source: "runtime", configured_at: "2026-08-24T10:00:00.000Z" }),
+    });
   });
-  await page.goto("/insights?status=candidate");
-  const insight = page.locator(".insight-candidate").first();
-  await insight.getByRole("button", { name: "接受" }).click();
-  await page.getByRole("button", { name: "确认判断" }).click();
-  await expect(page.getByText("洞察已接受", { exact: true })).toBeVisible();
+  await page.reload();
+  await page.locator(".role-button").click();
+  await page.getByRole("menuitemradio").filter({ hasText: "负责人" }).click();
+  await expect(page.locator(".role-button")).toContainText("负责人");
+  await page.goto("/ai-quality");
+  await page.getByRole("button", { name: "启动真实运行" }).click();
+  const dialog = page.getByRole("dialog", { name: "确认真实 Holdout API 用量" });
+  await expect(dialog).toBeVisible();
+  const confirm = dialog.getByRole("button", { name: "确认并运行 88 条" });
+  await expect(confirm).toBeDisabled();
+  await dialog.getByRole("checkbox").check();
+  await expect(confirm).toBeEnabled();
+  await dialog.getByRole("button", { name: "取消" }).click();
+  await expect(dialog).toHaveCount(0);
+});
+
+test("knowledge-grounded content loop reaches retrospective without automatic sending", async ({ page }) => {
+  await page.goto("/weekly");
+  const strategyCandidate = page.locator(".marketing-decision-panel").filter({ hasText: "本周策略候选" });
+  await expect(strategyCandidate).toContainText("enterprise-wechat-friend-marketing");
+  await expect(strategyCandidate).toContainText("进攻型增长");
+  await strategyCandidate.getByRole("button", { name: "原样采用" }).click();
+  await expect(page.getByText("候选已原样采用", { exact: true })).toBeVisible();
 
   await page.goto("/insights?status=accepted");
-  await page.getByRole("button", { name: "生成 Brief" }).click();
-  await page.getByRole("button", { name: "AI 生成候选" }).click();
-  await expect(page.getByText("不用重型改造也能开始", { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "人工采用 Brief" }).click();
-  await expect(page.getByText("内容 Brief 已采用", { exact: true })).toBeVisible();
+  const insight = page.locator(".insight-card").filter({ hasText: "担心工具增加维护负担" }).nth(1);
+  await insight.getByRole("button", { name: "查看 Brief" }).click();
+  const briefCandidate = page.locator(".marketing-decision-panel").filter({ hasText: "内容 Brief候选" });
+  await expect(briefCandidate).toContainText("知识依据");
+  await briefCandidate.locator("details").first().click();
+  await expect(briefCandidate.locator("details").first().locator("small")).toContainText("chunk-");
+  await briefCandidate.getByRole("button", { name: "原样采用" }).click();
+  await expect(page.getByText("候选已原样采用", { exact: true })).toBeVisible();
 
-  await page.goto("/content?draft=draft-08");
-  await expect(page.getByText("内容 Brief · I", { exact: true })).toBeVisible();
+  await page.goto("/content?draft=draft-07");
+  await page.getByRole("button", { name: "审阅 AI 候选" }).click();
+  const draftCandidate = page.locator(".marketing-decision-panel").filter({ hasText: "内容草稿候选" });
+  await expect(draftCandidate).toContainText("业务证据");
+  await draftCandidate.getByRole("button", { name: "原样采用" }).click();
+  await expect(page.getByText("候选已原样采用", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "复制草稿" }).click();
   await page.getByRole("button", { name: "标记已发布" }).click();
   await page.getByRole("button", { name: "确认标记发布" }).click();
@@ -277,13 +309,10 @@ test("sales can reject a candidate without losing the selected reason", async ({
   await expect(page.getByText("AI 首稿已拒绝", { exact: true })).toBeVisible();
 });
 
-test("operations evaluates a candidate version and lead publishes then rolls back", async ({ page }) => {
+test("operations evaluates a code-bound marketing brain and lead publishes then rolls back", async ({ page }) => {
   await page.goto("/ai-quality");
   await expect(page.getByRole("heading", { name: "AI 质量中心" })).toBeVisible();
-  await page.getByLabel("版本名称").fill("customer-eval-v2.1.0-rc2");
-  await page.getByLabel("变更说明与策略摘要").fill("补充缺少上下文和证据冲突失败聚类");
-  await page.getByRole("button", { name: "创建候选" }).click();
-  await expect(page.getByText("Prompt 候选已创建", { exact: true })).toBeVisible();
+  await page.getByLabel("营销脑版本").selectOption("brain-v2.2-rc2");
   await page.getByLabel("数据切分").selectOption("holdout");
   await page.getByRole("button", { name: "运行离线评测" }).click();
   await expect(page.getByText("黄金集评测已完成", { exact: true })).toBeVisible();
@@ -291,11 +320,23 @@ test("operations evaluates a candidate version and lead publishes then rolls bac
 
   await page.locator(".role-button").click();
   await page.getByRole("menuitemradio").filter({ hasText: "负责人" }).click();
-  const promptPanel = page.locator(".version-panel").filter({ hasText: "Prompt 版本" });
-  const candidateRow = promptPanel.locator(".version-row").filter({ hasText: "customer-eval-v2.1.0-rc1" });
+  const brainPanel = page.locator(".version-panel").filter({ hasText: "营销脑版本" });
+  const candidateRow = brainPanel.locator(".version-row").filter({ hasText: "营销大脑 2.2-RC2" });
   await candidateRow.getByRole("button", { name: "发布" }).click();
-  await expect(page.getByText("Prompt 版本已发布", { exact: true })).toBeVisible();
-  const baselineRow = promptPanel.locator(".version-row").filter({ hasText: "customer-eval-v2.0.0" });
+  await expect(page.getByText("营销脑版本已发布", { exact: true })).toBeVisible();
+  const baselineRow = brainPanel.locator(".version-row").filter({ hasText: "营销大脑 2.2-RC1" });
   await baselineRow.getByRole("button", { name: "回滚" }).click();
-  await expect(page.getByText("Prompt 已回滚", { exact: true })).toBeVisible();
+  await expect(page.getByText("营销脑已回滚", { exact: true })).toBeVisible();
+});
+
+test("knowledge governance previews Chinese retrieval and fixed skill routing", async ({ page }) => {
+  await page.goto("/knowledge");
+  await expect(page.getByRole("heading", { name: "知识治理" })).toBeVisible();
+  await expect(page.getByText("中文 trigram", { exact: false })).toBeVisible();
+  await page.getByLabel("业务问题").fill("企微客户分组 周策略 窄市场 内容实验 授权门禁");
+  await page.getByRole("button", { name: "检索预览" }).click();
+  await expect(page.locator(".skill-route")).toContainText("enterprise-wechat-friend-marketing");
+  await expect(page.locator(".skill-route")).toContainText("marketing-growth-system");
+  await expect(page.locator(".retrieval-results article").first()).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1);
 });

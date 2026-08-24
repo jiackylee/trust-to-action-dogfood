@@ -1,11 +1,187 @@
-import type { AiMeta, CustomerEvaluation, Evidence, EvidenceStrength, StateCode, WeeklyRetrospective, WeeklyStrategy } from "./schemas";
+import type { AiMeta, ContentBriefProposal, ContentDraftProposal, CustomerEvaluation, Evidence, EvidenceStrength, StateCode, WeeklyRetrospective, WeeklyStrategy } from "./schemas";
 
 export type Role = "operations" | "sales" | "lead";
 export type Status = "pending" | "ready" | "review" | "approved" | "returned" | "done" | "blocked";
 export type PublicationChannel = "朋友圈" | "销售" | "官网" | "仅内部";
 export type ApprovalStatus = "not_required" | "required" | "pending" | "approved" | "returned";
+export type MarketingTaskType = "weekly_strategy" | "content_brief" | "content_draft" | "customer_nba";
+export type KnowledgeKind = "hard_guardrail" | "operating_principle" | "verified_experience" | "experience_baseline" | "theory" | "test_hypothesis" | "prohibited_action";
+export type KnowledgeSourceStatus = "ready" | "duplicate" | "unresolved" | "excluded" | "error";
+export type TenantFactType = "product_truth" | "expert_position" | "brand_voice" | "offer_definition";
+export type MarketingDecisionOutput = WeeklyStrategy | ContentBriefProposal | ContentDraftProposal | CustomerEvaluation;
 
 export type Versioned<T> = T & { id: string; revision: number; updated_at: string };
+
+export interface KnowledgeReference {
+  chunk_id: string;
+  source_id: string;
+  source_title: string;
+  heading_path: string[];
+  knowledge_kind: KnowledgeKind;
+  skill: string;
+  version: string;
+  excerpt: string;
+  score: number;
+}
+
+export interface MarketingDecisionEnvelope<T = MarketingDecisionOutput> {
+  task_type: MarketingTaskType;
+  output: T;
+  business_evidence_refs: string[];
+  knowledge_refs: KnowledgeReference[];
+  skill_route: string[];
+  assumptions: string[];
+  knowledge_conflicts: string[];
+  measurement_plan: string[];
+  growth_posture: "aggressive";
+  ai_meta: AiMeta;
+  knowledge_pack_version: string;
+  tenant_fact_version: string;
+  marketing_brain_version: string;
+  prompt_hash: string;
+  input_fingerprint: string;
+}
+
+export interface KnowledgePackVersionCore {
+  name: string;
+  content_hash: string;
+  status: "indexed" | "active" | "archived" | "failed";
+  source_count: number;
+  chunk_count: number;
+  unresolved_count: number;
+  duplicate_count: number;
+  indexed_at: string | null;
+  activated_at: string | null;
+  error: string | null;
+}
+export type KnowledgePackVersion = Versioned<KnowledgePackVersionCore>;
+
+export interface KnowledgeSourceCore {
+  pack_version_id: string;
+  relative_path: string;
+  title: string;
+  skill: string;
+  version: string;
+  market: string[];
+  channels: string[];
+  tasks: MarketingTaskType[];
+  lifecycle: string[];
+  stages: Array<"T" | "I" | "D" | "A">;
+  knowledge_kind: KnowledgeKind;
+  status: KnowledgeSourceStatus;
+  content_hash: string;
+  chunk_count: number;
+  error: string | null;
+}
+export type KnowledgeSource = Versioned<KnowledgeSourceCore>;
+
+export interface KnowledgeChunkCore {
+  pack_version_id: string;
+  source_id: string;
+  heading_path: string[];
+  ordinal: number;
+  content: string;
+  content_hash: string;
+  char_count: number;
+  skill: string;
+  market: string[];
+  channels: string[];
+  tasks: MarketingTaskType[];
+  lifecycle: string[];
+  stages: Array<"T" | "I" | "D" | "A">;
+  knowledge_kind: KnowledgeKind;
+}
+export type KnowledgeChunk = Versioned<KnowledgeChunkCore>;
+
+export interface KnowledgeRetrievalRunCore {
+  task_type: MarketingTaskType;
+  query: string;
+  filters: Record<string, string[]>;
+  skill_route: string[];
+  chunk_refs: string[];
+  source_refs: string[];
+  conflict_count: number;
+  latency_ms: number;
+  result_count: number;
+  created_at: string;
+}
+export type KnowledgeRetrievalRun = Versioned<KnowledgeRetrievalRunCore>;
+
+export interface TenantFactRecord {
+  id: string;
+  type: TenantFactType;
+  title: string;
+  statement: string;
+  status: "draft" | "published" | "expired" | "revoked";
+  markets: string[];
+  channels: string[];
+  evidence_refs: string[];
+  valid_from: string;
+  expires_at: string | null;
+}
+
+export interface TenantFactVersionCore {
+  name: string;
+  status: "draft" | "published" | "archived";
+  facts: TenantFactRecord[];
+  content_hash: string;
+  created_by: string;
+  published_by: string | null;
+  published_at: string | null;
+}
+export type TenantFactVersion = Versioned<TenantFactVersionCore>;
+
+export interface MarketingBrainVersionCore {
+  name: string;
+  status: "draft" | "published" | "archived";
+  prompt_hashes: Record<MarketingTaskType, string>;
+  skill_router_version: string;
+  retriever_version: string;
+  knowledge_pack_version_id: string;
+  tenant_fact_version_id: string;
+  model_router_version_id: string;
+  policy_version: string;
+  created_by: string;
+  published_by: string | null;
+  published_at: string | null;
+}
+export type MarketingBrainVersion = Versioned<MarketingBrainVersionCore>;
+
+export type MarketingDecisionKind = "accepted" | "modified" | "rejected";
+export type MarketingDecisionReasonCode = EvaluationReasonCode | "knowledge_not_applicable" | "tenant_fact_wrong" | "voice_mismatch" | "strategy_too_aggressive" | "experiment_weak";
+export type MarketingReviewOutcome = "retained" | "quality_reversal" | "new_evidence";
+
+export interface MarketingDecisionCandidateCore {
+  task_type: MarketingTaskType;
+  subject_id: string;
+  subject_revision: number;
+  evidence_fingerprint: string;
+  envelope: MarketingDecisionEnvelope;
+  status: "pending" | "accepted" | "modified" | "rejected" | "stale";
+  created_at: string;
+  expires_at: string;
+  decided_at: string | null;
+  decision_id: string | null;
+}
+export type MarketingDecisionCandidate = Versioned<MarketingDecisionCandidateCore>;
+
+export interface MarketingDecisionDecisionCore {
+  candidate_id: string;
+  task_type: MarketingTaskType;
+  subject_id: string;
+  decision: MarketingDecisionKind;
+  original_output: MarketingDecisionOutput;
+  final_output: MarketingDecisionOutput | null;
+  reason_code: MarketingDecisionReasonCode | null;
+  reason_note: string;
+  actor: string;
+  decided_at: string;
+  reviewed_within_48h: boolean;
+  review_outcome: MarketingReviewOutcome | null;
+  review_reason: string;
+  reviewed_at: string | null;
+}
+export type MarketingDecisionDecision = Versioned<MarketingDecisionDecisionCore>;
 
 export interface CustomerNote {
   id: string;
@@ -111,6 +287,7 @@ export interface RouterVersionCore {
 export type RouterVersion = Versioned<RouterVersionCore>;
 
 export interface GoldenCaseCore {
+  task_type: MarketingTaskType;
   split: "development" | "holdout";
   scenario: string;
   industry: string;
@@ -122,8 +299,44 @@ export interface GoldenCaseCore {
   expected_evidence_refs: string[];
   future_event: "retained" | "quality_reversal" | "new_evidence";
   double_reviewed: boolean;
+  query: string;
+  expected_skill_route: string[];
+  expected_knowledge_terms: string[];
 }
 export type GoldenCase = Versioned<GoldenCaseCore>;
+
+export interface LiveEvalGraderChecks {
+  reviewed: boolean;
+  state_correct: boolean;
+  nba_acceptable: boolean;
+  evidence_precise: boolean;
+  knowledge_hit_at_5: boolean;
+  knowledge_citation_precise: boolean;
+  business_evidence_precise: boolean;
+  policy_violation: boolean;
+  privacy_leak: boolean;
+  forbidden_source_hit: boolean;
+  unsupported_fact: boolean;
+  effective_adoption: boolean;
+}
+
+export interface LiveEvalCaseResult {
+  case_id: string;
+  task_type: MarketingTaskType;
+  status: "pending" | "running" | "completed" | "failed";
+  idempotency_key: string;
+  attempt_count: number;
+  retryable: boolean;
+  started_at: string | null;
+  completed_at: string | null;
+  model: string | null;
+  response_id: string | null;
+  latency_ms: number;
+  input_tokens: number;
+  output_tokens: number;
+  error_code: string | null;
+  checks: LiveEvalGraderChecks | null;
+}
 
 export interface EvalScore {
   state_accuracy: number;
@@ -135,19 +348,38 @@ export interface EvalScore {
   adoption_improvement_points: number;
   critical_slice_regression: number;
   p95_latency_ms: number;
+  macro_adoption_rate: number;
+  review_coverage_rate: number;
+  task_adoption_rates: Record<MarketingTaskType, number>;
+  knowledge_recall_at_5: number;
+  knowledge_citation_precision: number;
+  business_evidence_precision: number;
+  forbidden_source_hits: number;
+  unsupported_facts: number;
   passed: boolean;
 }
 
 export interface EvalRunCore {
-  prompt_version_id: string;
+  marketing_brain_version_id: string;
+  prompt_version_id?: string;
   router_version_id: string;
   split: "development" | "holdout";
-  status: "running" | "completed" | "failed";
+  mode: "replay" | "live";
+  status: "running" | "paused" | "completed" | "failed";
   case_count: number;
   score: EvalScore | null;
   started_at: string;
   completed_at: string | null;
   generated_by: string;
+  usage_confirmed_by?: string;
+  usage_confirmed_at?: string;
+  idempotency_key?: string;
+  processed_count?: number;
+  successful_count?: number;
+  failed_count?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  case_results?: LiveEvalCaseResult[];
 }
 export type EvalRun = Versioned<EvalRunCore>;
 
@@ -167,6 +399,23 @@ export interface AiQualityMetrics {
   escalation_rate: number;
   policy_violations: number;
   privacy_leaks: number;
+  macro_adoption_rate: number;
+  task_slices: Record<MarketingTaskType, {
+    adoption_rate: number;
+    review_coverage_rate: number;
+    reviewed: number;
+    pending: number;
+    quality_reversals: number;
+    knowledge_citation_precision: number;
+    source_applicability_rate: number;
+    p95_latency_ms: number;
+  }>;
+  knowledge_recall_at_5: number;
+  knowledge_citation_precision: number;
+  business_evidence_precision: number;
+  forbidden_source_hits: number;
+  unsupported_facts: number;
+  retrieval_hit_rate: number;
 }
 
 export interface CustomerCore {
@@ -460,6 +709,13 @@ export interface DomainState {
   router_versions: RouterVersion[];
   golden_cases: GoldenCase[];
   eval_runs: EvalRun[];
+  knowledge_pack_versions: KnowledgePackVersion[];
+  knowledge_sources: KnowledgeSource[];
+  knowledge_retrieval_runs: KnowledgeRetrievalRun[];
+  tenant_fact_versions: TenantFactVersion[];
+  marketing_brain_versions: MarketingBrainVersion[];
+  marketing_candidates: MarketingDecisionCandidate[];
+  marketing_decisions: MarketingDecisionDecision[];
   audits: AuditEvent[];
 }
 

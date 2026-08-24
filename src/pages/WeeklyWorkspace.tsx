@@ -5,9 +5,10 @@ import { aiClient } from "../data/ai-client";
 import { InlineAlert, LoadingState, SectionHeader } from "../components/UI";
 import { useAppStore } from "../store/AppStore";
 import { can } from "../domain/permissions";
+import { MarketingDecisionPanel } from "../components/MarketingDecisionPanel";
 
 export function WeeklyWorkspace() {
-  const { state, loading, health, saveWeeklyStrategy, saveWeeklyRetrospective, explainError, notify } = useAppStore();
+  const { state, loading, health, generateMarketingCandidate, saveWeeklyRetrospective, explainError } = useAppStore();
   const [generating, setGenerating] = useState<"strategy" | "retrospective" | null>(null);
   const [error, setError] = useState<{ code: string; message: string } | null>(null);
   if (loading || !state) return <LoadingState />;
@@ -17,6 +18,7 @@ export function WeeklyWorkspace() {
   const riskDrafts = state.drafts.filter((item) => item.approval_required && item.approval_status !== "approved").length;
   const pendingApprovals = state.approvals.filter((item) => item.status === "pending").length;
   const acceptedInsights = state.conversation_insights.filter((item) => item.status === "accepted" && !item.invalidated_reason);
+  const strategyCandidate = state.marketing_candidates.find((item) => item.task_type === "weekly_strategy" && item.subject_id === "weekly-plan" && item.status === "pending");
   const adoptedBriefs = state.content_briefs.filter((item) => item.status === "adopted").length;
   const syncedPublications = state.publications.filter((item) => item.status === "results_synced").length;
   const publicationsWithBusinessResults = state.publications.filter((publication) => state.content_outcomes.some((outcome) => outcome.publication_id === publication.id)).length;
@@ -34,7 +36,7 @@ export function WeeklyWorkspace() {
     setGenerating("strategy"); setError(null);
     try {
       const counts = Object.fromEntries(["T0", "T1", "I1", "D1", "A1", "C1"].map((code) => [code, currentState.customers.filter((item) => item.state === code).length]));
-      const result = await aiClient.weeklyStrategy({
+      await generateMarketingCandidate("weekly_strategy", "weekly-plan", 1, `${currentState.weekly_plan.strategy.theme} 企微窄市场周策略 内容密度 证据门禁`, {
         current_plan: currentState.weekly_plan,
         metrics: { ready_drafts: ready, pending_approvals: currentState.approvals.filter((item) => item.status === "pending").length, overdue_tasks: currentState.tasks.filter((item) => item.status !== "done" && new Date(item.due_at).getTime() < Date.now()).length },
         customer_states: counts,
@@ -43,8 +45,6 @@ export function WeeklyWorkspace() {
         accepted_insights: acceptedInsights,
         historical_outcomes: currentState.content_outcomes,
       });
-      await saveWeeklyStrategy(result.data, `${result.meta.model} · ${result.meta.response_id}`);
-      notify({ title: "周策略已生成", detail: `已写入提示词版本 ${result.meta.prompt_version}`, tone: "success" });
     } catch (cause) {
       const details = explainError(cause); setError(details);
     } finally { setGenerating(null); }
@@ -60,7 +60,9 @@ export function WeeklyWorkspace() {
   return <>
     <SectionHeader eyebrow="运营工作区" title="把会话信号推到下周策略" description="洞察、Brief、证明、审批、人工发布和结果保持完整血缘；所有外部动作仍由人执行。" actions={<button className="primary-button" onClick={() => void regenerate()} disabled={Boolean(generating) || !can(state.role, "generate_strategy")} title={!can(state.role, "generate_strategy") ? "只有运营角色可以生成周策略" : undefined}><Sparkles />{generating === "strategy" ? "正在生成…" : "AI 重新生成策略"}</button>} />
     {!health?.ai_configured && <InlineAlert tone="warning" title="AI 生成当前被阻断">本地 AI 服务尚未配置。现有输入与策略不会被覆盖，配置后可直接重试。</InlineAlert>}
+    {!health?.knowledge_configured && <InlineAlert tone="warning" title="私有知识包未配置">配置并激活 `KNOWLEDGE_PACK_PATH` 后才能生成 2.2 营销决策候选；系统不会静默退化为通用 Prompt。</InlineAlert>}
     {error && <InlineAlert tone="danger" title="策略生成失败">{error.message} <button className="text-button" onClick={() => void regenerate()}>重试</button><details className="technical-details"><summary>技术详情</summary><code>{error.code}</code></details></InlineAlert>}
+    {strategyCandidate && <MarketingDecisionPanel candidate={strategyCandidate} currentRevision={1} />}
     <section className="workflow-strip content-loop-strip" aria-label="本周内容工作流">{steps.map((step, index) => <div className={`workflow-step ${step.done ? "complete" : "blocked"}`} key={step.label}><div className="workflow-line"><span>{step.done ? <Check /> : <CircleDashed />}</span>{index < steps.length - 1 && <i />}</div><b>{step.label}</b><small>{step.detail}</small><Link to={step.to}>{({ 洞察: "判断洞察", Brief: "采用 Brief", 草稿: "编辑草稿", 证据: "补齐证据", 风险: "检查风险", 审批: "处理审批", 发布: "查看发布", 结果: "回填结果" } as Record<string, string>)[step.label]}<ArrowRight /></Link></div>)}</section>
     <div className="weekly-layout" id="strategy">
       <section className="panel strategy-panel"><div className="panel-heading"><div><span className="eyebrow">当前策略</span><h2>{state.weekly_plan.strategy.theme}</h2></div><span className="version-label">更新于 {formatDate(state.weekly_plan.generated_at)}</span></div><p className="strategy-objective">{state.weekly_plan.strategy.objective}</p>

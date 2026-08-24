@@ -5,7 +5,7 @@ import Database from "better-sqlite3";
 import { createFixtureState } from "../src/domain/fixtures";
 import type { DomainState } from "../src/domain/types";
 
-const FIXTURE_VERSION = 5;
+const FIXTURE_VERSION = 7;
 
 export class RepositoryConflictError extends Error {
   constructor() { super("Tenant state changed while the operation was running"); }
@@ -39,6 +39,8 @@ export class SqliteStateRepository implements StateRepository {
     this.#database.pragma("foreign_keys = ON");
     const migrationPath = fileURLToPath(new URL("./migrations/001_initial.sql", import.meta.url));
     this.#database.exec(fs.readFileSync(migrationPath, "utf8"));
+    const knowledgeMigrationPath = fileURLToPath(new URL("./migrations/002_knowledge.sql", import.meta.url));
+    this.#database.exec(fs.readFileSync(knowledgeMigrationPath, "utf8"));
   }
 
   load(tenantId: string): LoadedState {
@@ -87,5 +89,5 @@ export class SqliteStateRepository implements StateRepository {
 }
 
 export function defaultDatabasePath() {
-  return process.env.DATA_DB_PATH?.trim() || path.resolve(process.cwd(), "data/trust-to-action-v2.1.sqlite");
+  return process.env.DATA_DB_PATH?.trim() || path.resolve(process.cwd(), "data/trust-to-action-v2.2.sqlite");
 }

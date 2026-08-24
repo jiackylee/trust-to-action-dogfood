@@ -9,6 +9,7 @@ import { Execution } from "./pages/Execution";
 import { Governance } from "./pages/Governance";
 import { Insights } from "./pages/Insights";
 import { AiQuality } from "./pages/AiQuality";
+import { KnowledgeGovernance } from "./pages/KnowledgeGovernance";
 
 export function App() {
   return <Routes><Route element={<Shell />}>
@@ -22,6 +23,7 @@ export function App() {
     <Route path="execution" element={<Execution />} />
     <Route path="governance" element={<Governance />} />
     <Route path="ai-quality" element={<AiQuality />} />
+    <Route path="knowledge" element={<KnowledgeGovernance />} />
     <Route path="*" element={<Navigate to="/" replace />} />
   </Route></Routes>;
 }
