@@ -8,6 +8,7 @@ import { CustomerDetail, Customers } from "./pages/Customers";
 import { Execution } from "./pages/Execution";
 import { Governance } from "./pages/Governance";
 import { Insights } from "./pages/Insights";
+import { AiQuality } from "./pages/AiQuality";
 
 export function App() {
   return <Routes><Route element={<Shell />}>
@@ -20,6 +21,7 @@ export function App() {
     <Route path="customers/:customerId" element={<CustomerDetail />} />
     <Route path="execution" element={<Execution />} />
     <Route path="governance" element={<Governance />} />
+    <Route path="ai-quality" element={<AiQuality />} />
     <Route path="*" element={<Navigate to="/" replace />} />
   </Route></Routes>;
 }

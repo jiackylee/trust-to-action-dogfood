@@ -1,6 +1,7 @@
-import type { AnalysisBatch, Approval, ArchiveConsent, ArchiveConversation, ArchivedMessage, ContentBrief, ContentFamily, ContentOutcome, ConversationInsight, DomainState, Draft, Integration, Proof, PublicationRecord, Task } from "./types";
+import type { AnalysisBatch, Approval, ArchiveConsent, ArchiveConversation, ArchivedMessage, ContentBrief, ContentFamily, ContentOutcome, ConversationInsight, DomainState, Draft, EvalRun, EvaluationCandidate, EvaluationDecision, GenerationRun, GoldenCase, Integration, PromptVersion, Proof, PublicationRecord, RouterVersion, Task } from "./types";
 import type { Customer } from "./types";
 import { STATE_LABELS, type StateCode } from "./schemas";
+import { evidenceFingerprint } from "./quality";
 
 const NOW = "2026-08-23T15:00:00+08:00";
 const names = ["顾言", "沈宁", "程知", "唐禾", "苏越", "陆川", "姜楠", "宋佳", "叶舟", "白露", "徐嘉", "蒋闻", "高原", "阮青", "夏林", "孟乔", "杜衡", "何安", "许澄", "罗简", "林悦", "陈屿", "周恬", "袁初"];
@@ -54,6 +55,7 @@ function makeCustomers(): Customer[] {
         { id: `evi-${id}-2`, strength: "weak", type: "朋友圈互动", text: "浏览相关主题并产生一次轻互动，仅用于观察。", occurred_at: date(20 - (index % 3), 16), source: "客户朋友圈", valid: true, transaction_fact: false },
       ],
       evaluation: {
+        decision: state === "T0" ? "insufficient_evidence" : "recommend",
         objective: state === "A1" ? "确认决策人和实施边界" : "获得一条可推进状态的新证据",
         target_segment: state === "T0" ? "新线索" : "重点培育",
         state_before: state,
@@ -68,6 +70,8 @@ function makeCustomers(): Customer[] {
         risk_flags: state === "A1" ? ["价格 / Offer"] : [],
         approval_required: state === "A1",
         next_review_at: date(25 + (index % 3), 10),
+        evidence_assessment: [{ evidence_id: `evi-${id}-1`, supports: "both", weight: signal.strength, summary: signal.text }],
+        uncertainties: state === "T0" ? ["只有弱互动，缺少主动问题"] : [],
       },
       evaluation_meta: { model: "规则基线 V0.3", response_id: `fixture-${id}`, prompt_version: "fixture-v2" },
       notes: [],
@@ -272,14 +276,110 @@ function makeAnalysisBatches(insights: ConversationInsight[], messages: Archived
   }];
 }
 
+function makeGoldenCases(): GoldenCase[] {
+  const stateOrder: StateCode[] = ["T0", "T1", "I1", "D1", "A1", "C1"];
+  const actionByState = ["继续观察", "发送知识内容", "分享 Demo", "询问资格问题", "准备 Offer", "转人工"] as const;
+  return Array.from({ length: 200 }, (_, index) => {
+    const stateIndex = index % stateOrder.length;
+    const stateBefore = stateOrder[stateIndex];
+    const anomaly = index % 17 === 0 ? "数据过期" : index % 29 === 0 ? "证据冲突" : null;
+    const evidenceStrength = index % 5 === 0 ? "weak" as const : index % 3 === 0 ? "medium" as const : "strong" as const;
+    const canAdvance = !anomaly && evidenceStrength !== "weak" && stateIndex < stateOrder.length - 1;
+    const expectedState = canAdvance ? stateOrder[stateIndex + 1] : stateBefore;
+    const expectedIndex = stateOrder.indexOf(expectedState);
+    return {
+      id: `gold-${String(index + 1).padStart(3, "0")}`,
+      revision: 1,
+      updated_at: NOW,
+      split: index < 160 ? "development" : "holdout",
+      scenario: `${industries[index % industries.length]} · ${stateBefore} · ${evidenceStrength}证据${anomaly ? ` · ${anomaly}` : ""}`,
+      industry: industries[index % industries.length],
+      state_before: stateBefore,
+      evidence_strength: evidenceStrength,
+      anomaly,
+      expected_state: expectedState,
+      acceptable_nba: [actionByState[expectedIndex]],
+      expected_evidence_refs: [`gold-evi-${String(index + 1).padStart(3, "0")}`],
+      future_event: index % 13 === 0 ? "quality_reversal" : index % 7 === 0 ? "new_evidence" : "retained",
+      double_reviewed: index % 5 === 0,
+    };
+  });
+}
+
+function makeQualityFixtures(customers: Customer[]) {
+  const generationRuns: GenerationRun[] = [];
+  const candidates: EvaluationCandidate[] = [];
+  const decisions: EvaluationDecision[] = [];
+  for (let index = 0; index < 30; index += 1) {
+    const customer = customers[index % customers.length];
+    const runId = `run-${String(index + 1).padStart(2, "0")}`;
+    const candidateId = `candidate-${String(index + 1).padStart(2, "0")}`;
+    const decided = index < 24;
+    const createdAt = date(12 + (index % 11), 9 + (index % 7));
+    const model = index % 3 === 0 ? "gpt-5.6-terra" : "gpt-5.6";
+    const escalated = index % 8 === 0;
+    const fingerprint = evidenceFingerprint(customer);
+    const decision = index % 6 === 0 ? "modified" as const : index % 9 === 0 ? "rejected" as const : "accepted" as const;
+    const decisionId = decided ? `decision-${String(index + 1).padStart(2, "0")}` : null;
+    const meta = {
+      model, response_id: `resp-quality-${index + 1}`, prompt_version: index < 12 ? "customer-eval-v2.0.0" : "customer-eval-v2.1.0-rc1", generated_at: createdAt,
+      router_version: "router-v2.1.0-rc1", route_reason: model.includes("terra") ? "simple_t0_t1" : "high_risk_or_complex", attempts: escalated ? 2 : 1,
+      latency_ms: 4200 + index * 170, input_tokens: 720 + index * 4, output_tokens: 260 + index * 3,
+      escalated_from: escalated ? "gpt-5.6-terra" : null, input_fingerprint: fingerprint,
+    };
+    generationRuns.push({
+      id: runId, revision: 1, updated_at: createdAt, task: "customer_evaluation", subject_id: customer.id, status: "success", model, prompt_version: meta.prompt_version,
+      router_version: meta.router_version, route_reason: meta.route_reason, attempts: escalated
+        ? [{ model: "gpt-5.6-terra", status: "escalated", latency_ms: 2100, response_id: null, error_code: "LOW_CONFIDENCE" }, { model: "gpt-5.6", status: "success", latency_ms: meta.latency_ms - 2100, response_id: meta.response_id, error_code: null }]
+        : [{ model, status: "success", latency_ms: meta.latency_ms, response_id: meta.response_id, error_code: null }],
+      latency_ms: meta.latency_ms, input_tokens: meta.input_tokens, output_tokens: meta.output_tokens, input_fingerprint: meta.input_fingerprint, response_id: meta.response_id, error_code: null, created_at: createdAt,
+    });
+    candidates.push({
+      id: candidateId, revision: decided ? 2 : 1, updated_at: decided ? date(13 + (index % 10), 11) : createdAt, customer_id: customer.id, customer_revision: customer.revision,
+      evidence_fingerprint: meta.input_fingerprint, evaluation: customer.evaluation!, ai_meta: meta, run_id: runId, status: decided ? decision : "pending", created_at: createdAt,
+      expires_at: date(27, 18), decided_at: decided ? date(13 + (index % 10), 11) : null, decision_id: decisionId,
+    });
+    if (decided && decisionId) {
+      const reviewOutcome = index < 16 ? (index % 11 === 0 ? "quality_reversal" as const : index % 7 === 0 ? "new_evidence" as const : "retained" as const) : null;
+      decisions.push({
+        id: decisionId, revision: reviewOutcome ? 2 : 1, updated_at: date(20 + (index % 3), 14), candidate_id: candidateId, customer_id: customer.id, decision,
+        original_evaluation: customer.evaluation!, final_evaluation: decision === "rejected" ? null : customer.evaluation!,
+        reason_code: decision === "accepted" ? null : decision === "modified" ? "wrong_nba" : "missing_context", reason_note: decision === "accepted" ? "" : "合成盲测反馈",
+        actor: "陈牧", decided_at: date(13 + (index % 10), 11), reviewed_within_48h: index % 10 !== 0, review_outcome: reviewOutcome,
+        review_reason: reviewOutcome === "quality_reversal" ? "状态依据不足" : reviewOutcome === "new_evidence" ? "出现新的主动咨询" : "", reviewed_at: reviewOutcome ? date(20 + (index % 3), 14) : null,
+      });
+    }
+  }
+  return { generationRuns, candidates, decisions };
+}
+
+function makeAiVersions() {
+  const prompts: PromptVersion[] = [
+    { id: "prompt-v2.0", revision: 2, updated_at: date(10), name: "customer-eval-v2.0.0", task: "customer_evaluation", status: "published", description: "2.0 盲测基线", created_by: "系统", published_by: "周岚", published_at: date(10) },
+    { id: "prompt-v2.1-rc1", revision: 1, updated_at: NOW, name: "customer-eval-v2.1.0-rc1", task: "customer_evaluation", status: "draft", description: "证据分层、未知项与 NBA 约束", created_by: "林澈", published_by: null, published_at: null },
+  ];
+  const routers: RouterVersion[] = [
+    { id: "router-v2.0", revision: 2, updated_at: date(10), name: "router-v2.0-single", status: "published", primary_model: "gpt-5.6", fast_model: "gpt-5.6", confidence_threshold: 0, description: "2.0 单模型基线", created_by: "系统", published_by: "周岚", published_at: date(10) },
+    { id: "router-v2.1-rc1", revision: 1, updated_at: NOW, name: "router-v2.1-risk-first", status: "draft", primary_model: "gpt-5.6", fast_model: "gpt-5.6-terra", confidence_threshold: 75, description: "简单场景走 Terra，高风险直接主模型，只升不降", created_by: "林澈", published_by: null, published_at: null },
+  ];
+  const evalRuns: EvalRun[] = [{
+    id: "eval-baseline-holdout", revision: 1, updated_at: NOW, prompt_version_id: "prompt-v2.0", router_version_id: "router-v2.0", split: "holdout", status: "completed", case_count: 40,
+    score: { state_accuracy: 77.5, nba_acceptability: 72.5, evidence_precision: 100, policy_violations: 0, privacy_leaks: 0, first_draft_adoption: 55, adoption_improvement_points: 0, critical_slice_regression: 0, p95_latency_ms: 24800, passed: false },
+    started_at: date(21, 9), completed_at: date(21, 10), generated_by: "系统盲测",
+  }];
+  return { prompts, routers, evalRuns };
+}
+
 export function createFixtureState(): DomainState {
   const customers = makeCustomers();
   const archive = makeArchive(customers);
   const conversationInsights = makeInsights();
   const briefs = makeBriefs();
   const publicationHistory = makePublicationHistory();
+  const quality = makeQualityFixtures(customers);
+  const versions = makeAiVersions();
   return {
-    fixture_version: 4,
+    fixture_version: 5,
     role: "operations",
     week: 2,
     weekly_plan: {
@@ -328,6 +428,13 @@ export function createFixtureState(): DomainState {
         caveat: "时间关联，不代表因果",
       },
     },
+    generation_runs: quality.generationRuns,
+    evaluation_candidates: quality.candidates,
+    evaluation_decisions: quality.decisions,
+    prompt_versions: versions.prompts,
+    router_versions: versions.routers,
+    golden_cases: makeGoldenCases(),
+    eval_runs: versions.evalRuns,
     audits: [
       { id: "audit-01", actor: "系统", action: "生成周策略", detail: "主题：线索跟进不靠销售记忆", at: NOW, source: "system" },
       { id: "audit-02", actor: "林澈", action: "提交敏感审批", detail: "7 人销售团队案例", at: date(23, 11), source: "human" },

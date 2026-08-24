@@ -1,5 +1,13 @@
 import { expect, test } from "@playwright/test";
 
+test.beforeEach(async ({ page }) => {
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "内容经营台" })).toBeVisible();
+  await page.getByRole("button", { name: "重置演示数据" }).click();
+  await page.getByRole("button", { name: "确认重置" }).click();
+  await expect(page.getByText("演示数据已重置", { exact: true })).toBeVisible();
+});
+
 for (const viewport of [{ width: 1440, height: 900 }, { width: 1024, height: 768 }, { width: 390, height: 844 }]) {
   test(`responsive shell ${viewport.width}x${viewport.height}`, async ({ page }) => {
     const browserErrors: string[] = [];
@@ -27,6 +35,19 @@ for (const viewport of [{ width: 1440, height: 900 }, { width: 1024, height: 768
       await expect(page.locator(".nav-group").first().locator(".nav-link").first()).toHaveClass(/mobile-parent-active/);
       await page.goto("/proofs");
       await expect(page.locator(".nav-group").nth(1).locator(".nav-link").first()).toHaveClass(/mobile-parent-active/);
+    }
+    await page.goto("/ai-quality");
+    await expect(page.getByRole("heading", { name: "AI 质量中心" })).toBeVisible();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1);
+    if (viewport.width === 390) {
+      await expect(page.locator(".desktop-authoring")).toBeHidden();
+      await expect(page.getByText("Prompt 编辑、黄金集管理和版本对比在桌面端开放；移动端仍可查看质量指标。")).toBeVisible();
+      await page.locator(".role-button").click();
+      await page.getByRole("menuitemradio").filter({ hasText: "销售" }).click();
+      await page.goto("/customers");
+      await page.locator(".customer-cards .mobile-card").first().getByRole("link").click();
+      await expect(page.getByRole("button", { name: "原样采用并写入" })).toBeVisible();
+      expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1);
     }
     expect(browserErrors).toEqual([]);
   });
@@ -126,7 +147,7 @@ test("local AI key configuration keeps the secret ephemeral", async ({ page }) =
     await route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify({ ok: true, ai_configured: configured, model: configured ? "gpt-test" : "gpt-5.6", config_source: configured ? "runtime" : "none", configured_at: configured ? "2026-08-23T16:00:00.000Z" : null }),
+      body: JSON.stringify({ ok: true, ai_configured: configured, model: configured ? "gpt-test" : "gpt-5.6", fast_model: "gpt-5.6-terra", fast_model_available: true, data_mode: "http-sqlite", session_warning: null, config_source: configured ? "runtime" : "none", configured_at: configured ? "2026-08-23T16:00:00.000Z" : null }),
     });
   });
   await page.route("**/api/v2/ai/config", async (route) => {
@@ -216,4 +237,65 @@ test("raw message access is absent for operations and audited for owned sales co
   await page.getByRole("button", { name: "关闭对话框" }).click();
   await page.goto("/governance");
   await expect(page.getByText("查看会话原文", { exact: true })).toBeVisible();
+});
+
+test("sales adopts an AI candidate and records its seven-day review", async ({ page }) => {
+  await page.locator(".role-button").click();
+  await page.getByRole("menuitemradio").filter({ hasText: "销售" }).click();
+  await page.goto("/customers");
+  await page.getByText("待销售判断", { exact: true }).first().click();
+  await expect(page.locator(".evaluation-candidate-panel")).toBeInViewport();
+  await page.getByRole("button", { name: "原样采用并写入" }).click();
+  await expect(page.getByText("AI 首稿已原样采用", { exact: true })).toBeVisible();
+
+  await page.goto("/ai-quality");
+  await expect(page.getByRole("heading", { name: "我的 AI 反馈" })).toBeVisible();
+  const review = page.locator(".review-row").filter({ hasText: "cus-" }).first();
+  await review.getByRole("button", { name: "保持有效" }).click();
+  await expect(page.getByText("7 天质量复查已记录", { exact: true })).toBeVisible();
+});
+
+test("sales can modify a candidate with a structured reason", async ({ page }) => {
+  await page.locator(".role-button").click();
+  await page.getByRole("menuitemradio").filter({ hasText: "销售" }).click();
+  await page.goto("/customers");
+  await page.getByText("待销售判断", { exact: true }).first().click();
+  await page.getByRole("button", { name: "修改后采用" }).click();
+  await page.getByLabel("修改原因（必选）").selectOption("wrong_nba");
+  await page.getByRole("button", { name: "确认判断" }).click();
+  await expect(page.getByText("修改后已采用", { exact: true })).toBeVisible();
+});
+
+test("sales can reject a candidate without losing the selected reason", async ({ page }) => {
+  await page.locator(".role-button").click();
+  await page.getByRole("menuitemradio").filter({ hasText: "销售" }).click();
+  await page.goto("/customers");
+  await page.getByText("待销售判断", { exact: true }).first().click();
+  await page.locator(".evaluation-candidate-panel").getByRole("button", { name: "拒绝", exact: true }).click();
+  await page.getByLabel("拒绝原因（必选）").selectOption("missing_context");
+  await page.getByRole("button", { name: "确认判断" }).click();
+  await expect(page.getByText("AI 首稿已拒绝", { exact: true })).toBeVisible();
+});
+
+test("operations evaluates a candidate version and lead publishes then rolls back", async ({ page }) => {
+  await page.goto("/ai-quality");
+  await expect(page.getByRole("heading", { name: "AI 质量中心" })).toBeVisible();
+  await page.getByLabel("版本名称").fill("customer-eval-v2.1.0-rc2");
+  await page.getByLabel("变更说明与策略摘要").fill("补充缺少上下文和证据冲突失败聚类");
+  await page.getByRole("button", { name: "创建候选" }).click();
+  await expect(page.getByText("Prompt 候选已创建", { exact: true })).toBeVisible();
+  await page.getByLabel("数据切分").selectOption("holdout");
+  await page.getByRole("button", { name: "运行离线评测" }).click();
+  await expect(page.getByText("黄金集评测已完成", { exact: true })).toBeVisible();
+  await expect(page.getByText("全部门槛通过", { exact: true })).toBeVisible();
+
+  await page.locator(".role-button").click();
+  await page.getByRole("menuitemradio").filter({ hasText: "负责人" }).click();
+  const promptPanel = page.locator(".version-panel").filter({ hasText: "Prompt 版本" });
+  const candidateRow = promptPanel.locator(".version-row").filter({ hasText: "customer-eval-v2.1.0-rc1" });
+  await candidateRow.getByRole("button", { name: "发布" }).click();
+  await expect(page.getByText("Prompt 版本已发布", { exact: true })).toBeVisible();
+  const baselineRow = promptPanel.locator(".version-row").filter({ hasText: "customer-eval-v2.0.0" });
+  await baselineRow.getByRole("button", { name: "回滚" }).click();
+  await expect(page.getByText("Prompt 已回滚", { exact: true })).toBeVisible();
 });

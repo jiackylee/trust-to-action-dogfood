@@ -23,6 +23,152 @@ export interface NbaDecision {
   task_id: string | null;
 }
 
+export type EvaluationDecisionKind = "accepted" | "modified" | "rejected";
+export type EvaluationReasonCode = "wrong_state" | "wrong_evidence" | "wrong_nba" | "missing_context" | "risk_compliance" | "too_generic" | "other";
+export type EvaluationReviewOutcome = "retained" | "quality_reversal" | "new_evidence";
+
+export interface ModelAttempt {
+  model: string;
+  status: "success" | "failed" | "escalated";
+  latency_ms: number;
+  response_id: string | null;
+  error_code: string | null;
+}
+
+export interface GenerationRunCore {
+  task: "customer_evaluation";
+  subject_id: string;
+  status: "success" | "blocked" | "failed";
+  model: string;
+  prompt_version: string;
+  router_version: string;
+  route_reason: string;
+  attempts: ModelAttempt[];
+  latency_ms: number;
+  input_tokens: number;
+  output_tokens: number;
+  input_fingerprint: string;
+  response_id: string | null;
+  error_code: string | null;
+  created_at: string;
+}
+export type GenerationRun = Versioned<GenerationRunCore>;
+
+export interface EvaluationCandidateCore {
+  customer_id: string;
+  customer_revision: number;
+  evidence_fingerprint: string;
+  evaluation: CustomerEvaluation;
+  ai_meta: AiMeta;
+  run_id: string;
+  status: "pending" | "accepted" | "modified" | "rejected" | "stale";
+  created_at: string;
+  expires_at: string;
+  decided_at: string | null;
+  decision_id: string | null;
+}
+export type EvaluationCandidate = Versioned<EvaluationCandidateCore>;
+
+export interface EvaluationDecisionCore {
+  candidate_id: string;
+  customer_id: string;
+  decision: EvaluationDecisionKind;
+  original_evaluation: CustomerEvaluation;
+  final_evaluation: CustomerEvaluation | null;
+  reason_code: EvaluationReasonCode | null;
+  reason_note: string;
+  actor: string;
+  decided_at: string;
+  reviewed_within_48h: boolean;
+  review_outcome: EvaluationReviewOutcome | null;
+  review_reason: string;
+  reviewed_at: string | null;
+}
+export type EvaluationDecision = Versioned<EvaluationDecisionCore>;
+
+export interface PromptVersionCore {
+  name: string;
+  task: "customer_evaluation";
+  status: "draft" | "published" | "archived";
+  description: string;
+  created_by: string;
+  published_by: string | null;
+  published_at: string | null;
+}
+export type PromptVersion = Versioned<PromptVersionCore>;
+
+export interface RouterVersionCore {
+  name: string;
+  status: "draft" | "published" | "archived";
+  primary_model: string;
+  fast_model: string;
+  confidence_threshold: number;
+  description: string;
+  created_by: string;
+  published_by: string | null;
+  published_at: string | null;
+}
+export type RouterVersion = Versioned<RouterVersionCore>;
+
+export interface GoldenCaseCore {
+  split: "development" | "holdout";
+  scenario: string;
+  industry: string;
+  state_before: StateCode;
+  evidence_strength: EvidenceStrength;
+  anomaly: string | null;
+  expected_state: StateCode;
+  acceptable_nba: CustomerEvaluation["recommendation"][];
+  expected_evidence_refs: string[];
+  future_event: "retained" | "quality_reversal" | "new_evidence";
+  double_reviewed: boolean;
+}
+export type GoldenCase = Versioned<GoldenCaseCore>;
+
+export interface EvalScore {
+  state_accuracy: number;
+  nba_acceptability: number;
+  evidence_precision: number;
+  policy_violations: number;
+  privacy_leaks: number;
+  first_draft_adoption: number;
+  adoption_improvement_points: number;
+  critical_slice_regression: number;
+  p95_latency_ms: number;
+  passed: boolean;
+}
+
+export interface EvalRunCore {
+  prompt_version_id: string;
+  router_version_id: string;
+  split: "development" | "holdout";
+  status: "running" | "completed" | "failed";
+  case_count: number;
+  score: EvalScore | null;
+  started_at: string;
+  completed_at: string | null;
+  generated_by: string;
+}
+export type EvalRun = Versioned<EvalRunCore>;
+
+export interface AiQualityMetrics {
+  first_draft_adoption_rate: number;
+  baseline_adoption_rate: number;
+  review_coverage_rate: number;
+  reviewed_candidates: number;
+  mature_candidates: number;
+  pending_candidates: number;
+  stale_candidates: number;
+  state_accuracy: number;
+  nba_acceptability: number;
+  evidence_precision: number;
+  p95_latency_ms: number;
+  fast_model_share: number;
+  escalation_rate: number;
+  policy_violations: number;
+  privacy_leaks: number;
+}
+
 export interface CustomerCore {
   name: string;
   company: string;
@@ -307,6 +453,13 @@ export interface DomainState {
   content_outcomes: ContentOutcome[];
   analysis_batches: AnalysisBatch[];
   weekly_retrospective: WeeklyRetrospectiveRecord;
+  generation_runs: GenerationRun[];
+  evaluation_candidates: EvaluationCandidate[];
+  evaluation_decisions: EvaluationDecision[];
+  prompt_versions: PromptVersion[];
+  router_versions: RouterVersion[];
+  golden_cases: GoldenCase[];
+  eval_runs: EvalRun[];
   audits: AuditEvent[];
 }
 
