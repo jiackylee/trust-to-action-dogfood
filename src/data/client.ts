@@ -1,13 +1,15 @@
 import { createFixtureState } from "../domain/fixtures";
+import { sessionClient } from "./session-client";
 import { actorForRole, can, canAccessCustomer, canActOnTask, canViewRawConversation } from "../domain/permissions";
 import { draftApprovalRisks, insightTrendScope, isMaterialDraftChange, proofCompleteness, proofIsUsable, validateCustomerEvaluation, validateInsightLineage } from "../domain/policy";
+import { candidateIsStale, evidenceFingerprint, scoreSyntheticGoldenSet } from "../domain/quality";
 import type { AiMeta, CustomerEvaluation, WeeklyRetrospective } from "../domain/schemas";
-import type { AnalysisBatch, ApiProblem, Approval, ContentBrief, ContentOutcome, ConversationInsight, DomainState, Draft, NbaDecision, Proof, ProofCore, PublicationRecord, Role, Task } from "../domain/types";
+import type { AnalysisBatch, ApiProblem, Approval, ContentBrief, ContentOutcome, ConversationInsight, DomainState, Draft, EvalRun, EvaluationCandidate, EvaluationDecision, EvaluationDecisionKind, EvaluationReasonCode, EvaluationReviewOutcome, GenerationRun, NbaDecision, Proof, ProofCore, PublicationRecord, Role, Task } from "../domain/types";
 
-const STORAGE_KEY = "trust-to-action-dogfood-v2";
-const FIXTURE_VERSION = 4;
+const STORAGE_KEY = "trust-to-action-dogfood-v2-1";
+const FIXTURE_VERSION = 5;
 
-type NewProof = Omit<ProofCore, "completeness" | "missing_fields" | "referenced_by">;
+export type NewProof = Omit<ProofCore, "completeness" | "missing_fields" | "referenced_by">;
 
 export interface DataClient {
   getState(): Promise<DomainState>;
@@ -16,7 +18,13 @@ export interface DataClient {
   submitDraftApproval(id: string, expectedRevision: number): Promise<DomainState>;
   saveProof(proof: Proof, expectedRevision: number): Promise<DomainState>;
   createProof(proof: NewProof): Promise<DomainState>;
-  applyCustomerEvaluation(customerId: string, evaluation: CustomerEvaluation, meta: AiMeta, expectedRevision: number): Promise<DomainState>;
+  decideEvaluationCandidate(customerId: string, candidateId: string, decision: EvaluationDecisionKind, evaluation: CustomerEvaluation | null, reasonCode: EvaluationReasonCode | null, reasonNote: string, expectedRevision: number): Promise<DomainState>;
+  recordEvaluationReview(decisionId: string, outcome: EvaluationReviewOutcome, reason: string, expectedRevision: number): Promise<DomainState>;
+  runGoldenEvaluation(promptVersionId: string, routerVersionId: string, split: "development" | "holdout"): Promise<DomainState>;
+  createPromptVersion(name: string, description: string): Promise<DomainState>;
+  createRouterVersion(name: string, description: string, confidenceThreshold: number): Promise<DomainState>;
+  promoteAiVersion(kind: "prompt" | "router", versionId: string, expectedRevision: number): Promise<DomainState>;
+  rollbackAiVersion(kind: "prompt" | "router", versionId: string, expectedRevision: number): Promise<DomainState>;
   decideNba(customerId: string, decision: NbaDecision["decision"], action: string, reason: string, expectedRevision: number): Promise<DomainState>;
   addCustomerNote(customerId: string, text: string, expectedRevision: number): Promise<DomainState>;
   decideApproval(id: string, decision: "approved" | "returned", reason: string, expectedRevision: number): Promise<DomainState>;
@@ -58,28 +66,33 @@ function normalizeProof(proof: Proof): Proof {
   return { ...proof, ...completeness, status };
 }
 
-class MockDataClient implements DataClient {
+export interface StateDataClientOptions {
+  initialState: DomainState;
+  persist?: (state: DomainState) => void;
+  latency?: () => Promise<void>;
+  reset?: () => DomainState;
+}
+
+export class StateDataClient implements DataClient {
   #state: DomainState;
+  #persistState: (state: DomainState) => void;
+  #wait: () => Promise<void>;
+  #resetState: () => DomainState;
 
-  constructor() { this.#state = this.#load(); }
-
-  #load() {
-    try {
-      const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "null") as DomainState | null;
-      if (parsed?.fixture_version === FIXTURE_VERSION) return parsed;
-    } catch {
-      // Corrupted or old synthetic state is safely replaced by the current fixture.
-    }
-    return createFixtureState();
+  constructor(options: StateDataClientOptions) {
+    this.#state = structuredClone(options.initialState);
+    this.#persistState = options.persist ?? (() => undefined);
+    this.#wait = options.latency ?? (async () => undefined);
+    this.#resetState = options.reset ?? createFixtureState;
   }
 
   #persist(next: DomainState) {
     this.#state = next;
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+    this.#persistState(next);
     return structuredClone(next);
   }
 
-  async #latency() { await new Promise((resolve) => window.setTimeout(resolve, 90)); }
+  async #latency() { await this.#wait(); }
   async getState() { await this.#latency(); return structuredClone(this.#state); }
   async setRole(role: Role) { await this.#latency(); return this.#persist({ ...this.#state, role }); }
 
@@ -166,17 +179,166 @@ class MockDataClient implements DataClient {
     return this.#persist({ ...this.#state, proofs: [created, ...this.#state.proofs], audits: [audit, ...this.#state.audits] });
   }
 
-  async applyCustomerEvaluation(customerId: string, evaluation: CustomerEvaluation, meta: AiMeta, expectedRevision: number) {
+  async saveEvaluationCandidate(run: GenerationRun, candidate: EvaluationCandidate) {
     await this.#latency();
-    if (!can(this.#state.role, "evaluate_customer")) throw problem(403, "FORBIDDEN", "当前角色不能评估客户");
+    if (!can(this.#state.role, "evaluate_customer")) throw problem(403, "FORBIDDEN", "当前角色不能生成客户评估");
+    const customer = this.#state.customers.find((item) => item.id === candidate.customer_id);
+    if (!customer || !canAccessCustomer(this.#state.role, customer)) throw problem(404, "NOT_FOUND", "客户不存在或不在当前可见范围");
+    if (customer.revision !== candidate.customer_revision || evidenceFingerprint(customer) !== candidate.evidence_fingerprint) throw problem(409, "STALE_EVALUATION_INPUT", "客户或证据已变化，候选未保存", true, customer);
+    const savedAt = now();
+    const previous = this.#state.evaluation_candidates.map((item): EvaluationCandidate => item.customer_id === customer.id && item.status === "pending"
+      ? { ...item, status: "stale", revision: item.revision + 1, updated_at: savedAt }
+      : item);
+    const audit = { id: id("audit"), actor: "OpenAI", action: "生成客户评估候选", detail: `${customer.name} · ${candidate.evaluation.state_before} → ${candidate.evaluation.state_after} · ${candidate.evaluation.recommendation} · ${run.model}`, at: savedAt, source: "ai" as const };
+    return this.#persist({ ...this.#state, generation_runs: [run, ...this.#state.generation_runs], evaluation_candidates: [candidate, ...previous], audits: [audit, ...this.#state.audits] });
+  }
+
+  async saveGenerationRun(run: GenerationRun) {
+    await this.#latency();
+    if (!can(this.#state.role, "evaluate_customer")) throw problem(403, "FORBIDDEN", "当前角色不能记录客户评估运行");
+    const customer = this.#state.customers.find((item) => item.id === run.subject_id);
+    if (!customer || !canAccessCustomer(this.#state.role, customer)) throw problem(404, "NOT_FOUND", "客户不存在或不在当前可见范围");
+    const audit = { id: id("audit"), actor: "OpenAI", action: run.status === "blocked" ? "客户评估被策略阻断" : "客户评估生成失败", detail: `${customer.name} · ${run.model} · ${run.error_code ?? "UNKNOWN"}`, at: run.created_at, source: "ai" as const };
+    return this.#persist({ ...this.#state, generation_runs: [run, ...this.#state.generation_runs], audits: [audit, ...this.#state.audits] });
+  }
+
+  async decideEvaluationCandidate(customerId: string, candidateId: string, decision: EvaluationDecisionKind, evaluation: CustomerEvaluation | null, reasonCode: EvaluationReasonCode | null, reasonNote: string, expectedRevision: number) {
+    await this.#latency();
+    if (!can(this.#state.role, "review_evaluation")) throw problem(403, "FORBIDDEN", "只有负责销售可以判断 AI 候选");
     const customer = this.#state.customers.find((item) => item.id === customerId);
     if (!customer || !canAccessCustomer(this.#state.role, customer)) throw problem(404, "NOT_FOUND", "客户不存在或不在当前可见范围");
-    if (customer.revision !== expectedRevision) throw problem(409, "VERSION_CONFLICT", "客户状态已更新", true, customer);
-    const policy = validateCustomerEvaluation(customer, evaluation);
-    if (!policy.allowed) throw problem(422, policy.code, policy.reasons.join("；"));
-    const updated = { ...customer, state: evaluation.state_after, confidence: evaluation.confidence, review_at: evaluation.next_review_at, evaluation, evaluation_meta: { model: meta.model, response_id: meta.response_id, prompt_version: meta.prompt_version }, nba_decision: null, revision: expectedRevision + 1, updated_at: now() };
-    const audit = { id: id("audit"), actor: "OpenAI", action: "自动写入客户状态与下一最佳动作", detail: `${customer.name} · ${customer.state} → ${evaluation.state_after} · ${evaluation.recommendation} · ${meta.response_id}`, at: now(), source: "ai" as const };
-    return this.#persist({ ...this.#state, customers: this.#state.customers.map((item) => item.id === customerId ? updated : item), audits: [audit, ...this.#state.audits] });
+    const candidate = this.#state.evaluation_candidates.find((item) => item.id === candidateId && item.customer_id === customer.id);
+    if (!candidate) throw problem(404, "CANDIDATE_NOT_FOUND", "评估候选不存在");
+    if (candidate.status !== "pending") throw problem(409, "CANDIDATE_ALREADY_DECIDED", "该候选已处理", false, candidate);
+    if (customer.revision !== expectedRevision || candidate.customer_revision !== customer.revision || candidateIsStale(this.#state, candidate)) throw problem(409, "STALE_EVALUATION_CANDIDATE", "客户或证据已变化，请重新生成候选", true, customer);
+    if (decision !== "accepted" && !reasonCode) throw problem(422, "REASON_REQUIRED", "修改或拒绝候选时必须选择原因");
+    if (reasonCode === "other" && !reasonNote.trim()) throw problem(422, "REASON_NOTE_REQUIRED", "选择其他原因时必须补充说明");
+    const finalEvaluation = decision === "accepted" ? candidate.evaluation : decision === "modified" ? evaluation : null;
+    if (decision === "modified" && !finalEvaluation) throw problem(422, "EVALUATION_REQUIRED", "修改后采用必须提供完整评估");
+    if (finalEvaluation) {
+      const policy = validateCustomerEvaluation(customer, finalEvaluation);
+      if (!policy.allowed) throw problem(422, policy.code, policy.reasons.join("；"));
+    }
+    const decidedAt = now();
+    const decisionId = id("evaluation-decision");
+    const decidedWithin48Hours = new Date(decidedAt).getTime() - new Date(candidate.created_at).getTime() <= 48 * 60 * 60_000;
+    const record: EvaluationDecision = {
+      id: decisionId, revision: 1, updated_at: decidedAt, candidate_id: candidate.id, customer_id: customer.id, decision,
+      original_evaluation: candidate.evaluation, final_evaluation: finalEvaluation, reason_code: decision === "accepted" ? null : reasonCode,
+      reason_note: reasonNote.trim(), actor: actorForRole(this.#state.role), decided_at: decidedAt, reviewed_within_48h: decidedWithin48Hours,
+      review_outcome: null, review_reason: "", reviewed_at: null,
+    };
+    const updatedCandidate: EvaluationCandidate = { ...candidate, status: decision, decided_at: decidedAt, decision_id: decisionId, revision: candidate.revision + 1, updated_at: decidedAt };
+    const updatedCustomer = finalEvaluation ? {
+      ...customer,
+      state: finalEvaluation.state_after,
+      confidence: finalEvaluation.confidence,
+      review_at: finalEvaluation.next_review_at,
+      evaluation: finalEvaluation,
+      evaluation_meta: { model: candidate.ai_meta.model, response_id: candidate.ai_meta.response_id, prompt_version: candidate.ai_meta.prompt_version },
+      nba_decision: null,
+      revision: customer.revision + 1,
+      updated_at: decidedAt,
+    } : customer;
+    const label = decision === "accepted" ? "原样采用 AI 首稿" : decision === "modified" ? "修改后采用 AI 首稿" : "拒绝 AI 首稿";
+    const audit = { id: id("audit"), actor: record.actor, action: label, detail: `${customer.name} · ${candidate.evaluation.state_after} · ${candidate.evaluation.recommendation}${reasonCode ? ` · ${reasonCode}` : ""}`, at: decidedAt, source: "human" as const };
+    return this.#persist({
+      ...this.#state,
+      customers: this.#state.customers.map((item) => item.id === customer.id ? updatedCustomer : item),
+      evaluation_candidates: this.#state.evaluation_candidates.map((item) => item.id === candidate.id ? updatedCandidate : item),
+      evaluation_decisions: [record, ...this.#state.evaluation_decisions],
+      audits: [audit, ...this.#state.audits],
+    });
+  }
+
+  async recordEvaluationReview(decisionId: string, outcome: EvaluationReviewOutcome, reason: string, expectedRevision: number) {
+    await this.#latency();
+    if (!can(this.#state.role, "review_evaluation")) throw problem(403, "FORBIDDEN", "只有销售可以记录 7 天复查结果");
+    const decision = this.#state.evaluation_decisions.find((item) => item.id === decisionId);
+    if (!decision) throw problem(404, "DECISION_NOT_FOUND", "评估决策不存在");
+    const customer = this.#state.customers.find((item) => item.id === decision.customer_id);
+    if (!customer || !canAccessCustomer(this.#state.role, customer)) throw problem(404, "NOT_FOUND", "客户不存在或不在当前可见范围");
+    if (decision.revision !== expectedRevision) throw problem(409, "VERSION_CONFLICT", "复查记录已更新", true, decision);
+    if (outcome !== "retained" && !reason.trim()) throw problem(422, "REVIEW_REASON_REQUIRED", "撤销或新增证据必须说明原因");
+    const reviewedAt = now();
+    const updated: EvaluationDecision = { ...decision, review_outcome: outcome, review_reason: reason.trim(), reviewed_at: reviewedAt, revision: decision.revision + 1, updated_at: reviewedAt };
+    const labels = { retained: "AI 判断 7 天后保持有效", quality_reversal: "AI 判断因质量问题撤销", new_evidence: "新增证据推动后续变化" };
+    const audit = { id: id("audit"), actor: actorForRole(this.#state.role), action: labels[outcome], detail: `${customer.name}${reason ? ` · ${reason}` : ""}`, at: reviewedAt, source: "human" as const };
+    return this.#persist({ ...this.#state, evaluation_decisions: this.#state.evaluation_decisions.map((item) => item.id === decision.id ? updated : item), audits: [audit, ...this.#state.audits] });
+  }
+
+  async runGoldenEvaluation(promptVersionId: string, routerVersionId: string, split: "development" | "holdout") {
+    await this.#latency();
+    if (!can(this.#state.role, "manage_ai_quality")) throw problem(403, "FORBIDDEN", "只有运营可以运行黄金集评测");
+    const prompt = this.#state.prompt_versions.find((item) => item.id === promptVersionId);
+    const router = this.#state.router_versions.find((item) => item.id === routerVersionId);
+    if (!prompt || !router) throw problem(404, "AI_VERSION_NOT_FOUND", "Prompt 或路由版本不存在");
+    const cases = this.#state.golden_cases.filter((item) => item.split === split);
+    const candidateVersion = prompt.name.includes("v2.1") || router.name.includes("v2.1");
+    const startedAt = now();
+    const run: EvalRun = {
+      id: id("eval"), revision: 1, updated_at: startedAt, prompt_version_id: prompt.id, router_version_id: router.id, split, status: "completed",
+      case_count: cases.length, score: scoreSyntheticGoldenSet(cases, candidateVersion), started_at: startedAt, completed_at: startedAt, generated_by: actorForRole(this.#state.role),
+    };
+    const audit = { id: id("audit"), actor: actorForRole(this.#state.role), action: "运行 AI 黄金集评测", detail: `${prompt.name} · ${router.name} · ${split} ${cases.length} 条 · ${run.score?.passed ? "通过" : "未通过"}`, at: startedAt, source: "system" as const };
+    return this.#persist({ ...this.#state, eval_runs: [...this.#state.eval_runs, run], audits: [audit, ...this.#state.audits] });
+  }
+
+  async createPromptVersion(name: string, description: string) {
+    await this.#latency();
+    if (!can(this.#state.role, "manage_ai_quality")) throw problem(403, "FORBIDDEN", "只有运营可以创建 Prompt 候选");
+    if (!name.trim() || !description.trim()) throw problem(422, "VERSION_FIELDS_REQUIRED", "版本名称和变更说明不能为空");
+    if (this.#state.prompt_versions.some((item) => item.name === name.trim())) throw problem(409, "VERSION_NAME_EXISTS", "Prompt 版本名称已存在");
+    const createdAt = now();
+    const version = { id: id("prompt"), revision: 1, updated_at: createdAt, name: name.trim(), task: "customer_evaluation" as const, status: "draft" as const, description: description.trim(), created_by: actorForRole(this.#state.role), published_by: null, published_at: null };
+    const audit = { id: id("audit"), actor: actorForRole(this.#state.role), action: "创建 Prompt 候选", detail: `${version.name} · ${version.description}`, at: createdAt, source: "human" as const };
+    return this.#persist({ ...this.#state, prompt_versions: [...this.#state.prompt_versions, version], audits: [audit, ...this.#state.audits] });
+  }
+
+  async createRouterVersion(name: string, description: string, confidenceThreshold: number) {
+    await this.#latency();
+    if (!can(this.#state.role, "manage_ai_quality")) throw problem(403, "FORBIDDEN", "只有运营可以创建路由候选");
+    if (!name.trim() || !description.trim()) throw problem(422, "VERSION_FIELDS_REQUIRED", "版本名称和变更说明不能为空");
+    if (this.#state.router_versions.some((item) => item.name === name.trim())) throw problem(409, "VERSION_NAME_EXISTS", "路由版本名称已存在");
+    if (!Number.isInteger(confidenceThreshold) || confidenceThreshold < 50 || confidenceThreshold > 95) throw problem(422, "ROUTER_THRESHOLD_INVALID", "Terra 升级阈值必须为 50 到 95 的整数");
+    const createdAt = now();
+    const version = { id: id("router"), revision: 1, updated_at: createdAt, name: name.trim(), status: "draft" as const, primary_model: "gpt-5.6", fast_model: "gpt-5.6-terra", confidence_threshold: confidenceThreshold, description: description.trim(), created_by: actorForRole(this.#state.role), published_by: null, published_at: null };
+    const audit = { id: id("audit"), actor: actorForRole(this.#state.role), action: "创建路由候选", detail: `${version.name} · Terra < ${confidenceThreshold} 升级`, at: createdAt, source: "human" as const };
+    return this.#persist({ ...this.#state, router_versions: [...this.#state.router_versions, version], audits: [audit, ...this.#state.audits] });
+  }
+
+  async promoteAiVersion(kind: "prompt" | "router", versionId: string, expectedRevision: number) {
+    await this.#latency();
+    if (!can(this.#state.role, "publish_ai_version")) throw problem(403, "FORBIDDEN", "只有负责人可以发布 AI 版本");
+    const versions = kind === "prompt" ? this.#state.prompt_versions : this.#state.router_versions;
+    const version = versions.find((item) => item.id === versionId);
+    if (!version) throw problem(404, "AI_VERSION_NOT_FOUND", "AI 版本不存在");
+    if (version.revision !== expectedRevision) throw problem(409, "VERSION_CONFLICT", "AI 版本已更新", true, version);
+    if (version.status !== "draft") throw problem(409, "VERSION_NOT_DRAFT", "只有候选版本可以发布", false, version);
+    const qualifyingRun = [...this.#state.eval_runs].reverse().find((item) => item.split === "holdout" && item.status === "completed" && item.score?.passed && (kind === "prompt" ? item.prompt_version_id === version.id : item.router_version_id === version.id));
+    if (!qualifyingRun) throw problem(422, "QUALITY_GATE_BLOCKED", "锁定 Holdout 尚未通过全部发布门槛");
+    const publishedAt = now();
+    const promoted = versions.map((item) => item.id === version.id
+      ? { ...item, status: "published" as const, published_by: actorForRole(this.#state.role), published_at: publishedAt, revision: item.revision + 1, updated_at: publishedAt }
+      : item.status === "published" ? { ...item, status: "archived" as const, revision: item.revision + 1, updated_at: publishedAt } : item);
+    const audit = { id: id("audit"), actor: actorForRole(this.#state.role), action: kind === "prompt" ? "发布 Prompt 版本" : "发布路由版本", detail: `${version.name} · Holdout ${qualifyingRun.score?.first_draft_adoption}% 首稿采用`, at: publishedAt, source: "human" as const };
+    return this.#persist({ ...this.#state, prompt_versions: kind === "prompt" ? promoted as DomainState["prompt_versions"] : this.#state.prompt_versions, router_versions: kind === "router" ? promoted as DomainState["router_versions"] : this.#state.router_versions, audits: [audit, ...this.#state.audits] });
+  }
+
+  async rollbackAiVersion(kind: "prompt" | "router", versionId: string, expectedRevision: number) {
+    await this.#latency();
+    if (!can(this.#state.role, "publish_ai_version")) throw problem(403, "FORBIDDEN", "只有负责人可以回滚 AI 版本");
+    const versions = kind === "prompt" ? this.#state.prompt_versions : this.#state.router_versions;
+    const version = versions.find((item) => item.id === versionId);
+    if (!version) throw problem(404, "AI_VERSION_NOT_FOUND", "AI 版本不存在");
+    if (version.revision !== expectedRevision) throw problem(409, "VERSION_CONFLICT", "AI 版本已更新", true, version);
+    if (version.status !== "archived" || !version.published_at) throw problem(422, "ROLLBACK_TARGET_INVALID", "只能回滚到曾经发布过的归档版本");
+    const rolledBackAt = now();
+    const rolledBack = versions.map((item) => item.id === version.id
+      ? { ...item, status: "published" as const, published_by: actorForRole(this.#state.role), published_at: rolledBackAt, revision: item.revision + 1, updated_at: rolledBackAt }
+      : item.status === "published" ? { ...item, status: "archived" as const, revision: item.revision + 1, updated_at: rolledBackAt } : item);
+    const audit = { id: id("audit"), actor: actorForRole(this.#state.role), action: kind === "prompt" ? "回滚 Prompt 版本" : "回滚路由版本", detail: `${version.name} · 恢复上一已验证版本`, at: rolledBackAt, source: "human" as const };
+    return this.#persist({ ...this.#state, prompt_versions: kind === "prompt" ? rolledBack as DomainState["prompt_versions"] : this.#state.prompt_versions, router_versions: kind === "router" ? rolledBack as DomainState["router_versions"] : this.#state.router_versions, audits: [audit, ...this.#state.audits] });
   }
 
   async decideNba(customerId: string, decision: NbaDecision["decision"], action: string, reason: string, expectedRevision: number) {
@@ -366,23 +528,52 @@ class MockDataClient implements DataClient {
   }
 
   async restoreSnapshot(snapshot: DomainState) { await this.#latency(); return this.#persist(structuredClone(snapshot)); }
-  async reset() { await this.#latency(); localStorage.removeItem(STORAGE_KEY); return this.#persist(createFixtureState()); }
+  async reset() { await this.#latency(); return this.#persist(this.#resetState()); }
+}
+
+function loadBrowserState() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "null") as DomainState | null;
+    if (parsed?.fixture_version === FIXTURE_VERSION) return parsed;
+  } catch {
+    // Corrupted or old synthetic state is safely replaced by the current fixture.
+  }
+  return createFixtureState();
+}
+
+class MockDataClient extends StateDataClient {
+  constructor() {
+    super({
+      initialState: loadBrowserState(),
+      persist: (state) => localStorage.setItem(STORAGE_KEY, JSON.stringify(state)),
+      latency: () => new Promise((resolve) => window.setTimeout(resolve, 90)),
+      reset: () => { localStorage.removeItem(STORAGE_KEY); return createFixtureState(); },
+    });
+  }
 }
 
 class HttpDataClient implements DataClient {
   async #request(path: string, init?: RequestInit) {
-    const response = await fetch(`/api/v2${path}`, { headers: { "content-type": "application/json", ...init?.headers }, ...init });
+    const method = init?.method?.toUpperCase() ?? "GET";
+    const csrf = method === "GET" || method === "HEAD" ? {} : await sessionClient.writeHeaders();
+    const response = await fetch(`/api/v2${path}`, { ...init, credentials: "same-origin", headers: { "content-type": "application/json", ...csrf, ...init?.headers } });
     const body = await response.json();
     if (!response.ok) throw body.error ?? problem(response.status, "HTTP_ERROR", "数据请求失败", response.status >= 500);
     return body as DomainState;
   }
   getState() { return this.#request("/state"); }
-  setRole(role: Role) { return this.#request("/role", { method: "PUT", body: JSON.stringify({ role }) }); }
+  async setRole(role: Role) { return (await sessionClient.switchRole(role)).state; }
   saveDraft(draft: Draft, expectedRevision: number) { return this.#request(`/drafts/${draft.id}`, { method: "PUT", body: JSON.stringify({ draft, expected_revision: expectedRevision }) }); }
   submitDraftApproval(idValue: string, expectedRevision: number) { return this.#request(`/drafts/${idValue}/approval`, { method: "POST", body: JSON.stringify({ expected_revision: expectedRevision }) }); }
   saveProof(proof: Proof, expectedRevision: number) { return this.#request(`/proofs/${proof.id}`, { method: "PUT", body: JSON.stringify({ proof, expected_revision: expectedRevision }) }); }
   createProof(proof: NewProof) { return this.#request("/proofs", { method: "POST", body: JSON.stringify({ proof }) }); }
-  applyCustomerEvaluation(customerId: string, evaluation: CustomerEvaluation, meta: AiMeta, expectedRevision: number) { return this.#request(`/customers/${customerId}/evaluation`, { method: "POST", body: JSON.stringify({ evaluation, meta, expected_revision: expectedRevision }) }); }
+  decideEvaluationCandidate(customerId: string, candidateId: string, decision: EvaluationDecisionKind, evaluation: CustomerEvaluation | null, reasonCode: EvaluationReasonCode | null, reasonNote: string, expectedRevision: number) { return this.#request(`/customers/${customerId}/evaluation-decisions`, { method: "POST", body: JSON.stringify({ candidate_id: candidateId, decision, evaluation, reason_code: reasonCode, reason_note: reasonNote, expected_revision: expectedRevision }) }); }
+  recordEvaluationReview(decisionId: string, outcome: EvaluationReviewOutcome, reason: string, expectedRevision: number) { return this.#request(`/evaluation-decisions/${decisionId}/review`, { method: "POST", body: JSON.stringify({ outcome, reason, expected_revision: expectedRevision }) }); }
+  runGoldenEvaluation(promptVersionId: string, routerVersionId: string, split: "development" | "holdout") { return this.#request("/ai-quality/eval-runs", { method: "POST", body: JSON.stringify({ prompt_version_id: promptVersionId, router_version_id: routerVersionId, split }) }); }
+  createPromptVersion(name: string, description: string) { return this.#request("/ai-quality/prompt-versions", { method: "POST", body: JSON.stringify({ name, description }) }); }
+  createRouterVersion(name: string, description: string, confidenceThreshold: number) { return this.#request("/ai-quality/router-versions", { method: "POST", body: JSON.stringify({ name, description, confidence_threshold: confidenceThreshold }) }); }
+  promoteAiVersion(kind: "prompt" | "router", versionId: string, expectedRevision: number) { return this.#request(`/ai-quality/${kind}-versions/${versionId}/promote`, { method: "POST", body: JSON.stringify({ expected_revision: expectedRevision }) }); }
+  rollbackAiVersion(kind: "prompt" | "router", versionId: string, expectedRevision: number) { return this.#request(`/ai-quality/${kind}-versions/${versionId}/rollback`, { method: "POST", body: JSON.stringify({ expected_revision: expectedRevision }) }); }
   decideNba(customerId: string, decision: NbaDecision["decision"], action: string, reason: string, expectedRevision: number) { return this.#request(`/customers/${customerId}/nba`, { method: "POST", body: JSON.stringify({ decision, action, reason, expected_revision: expectedRevision }) }); }
   addCustomerNote(customerId: string, text: string, expectedRevision: number) { return this.#request(`/customers/${customerId}/notes`, { method: "POST", body: JSON.stringify({ text, expected_revision: expectedRevision }) }); }
   decideApproval(idValue: string, decision: "approved" | "returned", reason: string, expectedRevision: number) { return this.#request(`/approvals/${idValue}`, { method: "PUT", body: JSON.stringify({ decision, reason, expected_revision: expectedRevision }) }); }
@@ -396,10 +587,10 @@ class HttpDataClient implements DataClient {
   recordContentOutcome(publicationId: string, type: ContentOutcome["type"], detail: string, customerId: string | null) { return this.#request(`/publications/${publicationId}/outcomes`, { method: "POST", body: JSON.stringify({ type, detail, customer_id: customerId }) }); }
   saveWeeklyRetrospective(retrospective: WeeklyRetrospective, meta: AiMeta | null, generatedBy: string, expectedRevision: number) { return this.#request("/weekly-retrospective", { method: "PUT", body: JSON.stringify({ retrospective, meta, generated_by: generatedBy, expected_revision: expectedRevision }) }); }
   saveWeeklyPlan(strategy: DomainState["weekly_plan"]["strategy"], generatedBy: string) { return this.#request("/weekly-plan", { method: "PUT", body: JSON.stringify({ strategy, generated_by: generatedBy }) }); }
-  restoreSnapshot(snapshot: DomainState) { return this.#request("/undo", { method: "POST", body: JSON.stringify({ snapshot }) }); }
+  restoreSnapshot(_snapshot: DomainState) { return this.#request("/undo", { method: "POST", body: JSON.stringify({}) }); }
   reset() { return this.#request("/reset", { method: "POST" }); }
 }
 
-export function createDataClient(mode = import.meta.env.VITE_DATA_MODE ?? "mock"): DataClient {
+export function createDataClient(mode = import.meta.env.VITE_DATA_MODE ?? "http"): DataClient {
   return mode === "http" ? new HttpDataClient() : new MockDataClient();
 }

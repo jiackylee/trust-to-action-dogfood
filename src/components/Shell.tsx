@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { NavLink, Outlet, useLocation } from "react-router-dom";
-import { Activity, BriefcaseBusiness, ChevronDown, CircleUserRound, FileText, Gauge, Library, ListChecks, MessageSquareText, RotateCcw, ShieldCheck, Sparkles, Users } from "lucide-react";
+import { Activity, BarChart3, BriefcaseBusiness, ChevronDown, CircleUserRound, FileText, Gauge, Library, ListChecks, MessageSquareText, RotateCcw, ShieldCheck, Sparkles, Users } from "lucide-react";
 import { Modal, ToastRegion } from "./UI";
 import { useAppStore } from "../store/AppStore";
 import type { Role } from "../domain/types";
@@ -10,7 +10,7 @@ const nav = [
   { group: "内容", items: [{ to: "/insights", label: "会话洞察", icon: MessageSquareText }, { to: "/content", label: "草稿与发布", icon: FileText }, { to: "/proofs", label: "证明资产", icon: Library }] },
   { group: "客户", items: [{ to: "/customers", label: "客户状态", icon: Users }] },
   { group: "执行", items: [{ to: "/execution", label: "任务与审批", icon: ListChecks }] },
-  { group: "治理", items: [{ to: "/governance", label: "数据与审计", icon: ShieldCheck }] },
+  { group: "治理", items: [{ to: "/ai-quality", label: "AI 质量", icon: BarChart3 }, { to: "/governance", label: "数据与审计", icon: ShieldCheck }] },
 ];
 
 const roles: Array<{ value: Role; label: string; person: string }> = [
@@ -36,7 +36,7 @@ export function Shell() {
   }, [roleOpen]);
   return <div className="app-shell">
     <aside className="sidebar" aria-label="主导航">
-      <div className="brand" title="Trust-to-Action 2.0"><span className="brand-mark"><Sparkles /></span><span className="brand-copy"><strong>Trust-to-Action</strong><small>内部增长副驾 · 2.0</small></span></div>
+      <div className="brand" title="Trust-to-Action 2.1"><span className="brand-mark"><Sparkles /></span><span className="brand-copy"><strong>Trust-to-Action</strong><small>内部增长副驾 · 2.1</small></span></div>
       <nav className="nav-groups">{nav.map((section) => <div className="nav-group" key={section.group}><div className="nav-group-label">{section.group}</div>{section.items.map((item, index) => <NavLink key={item.to} to={item.to} end={item.to === "/"} className={({ isActive }) => `nav-link${isActive ? " active" : ""}${index === 0 && isSectionActive(section.group, location.pathname) ? " mobile-parent-active" : ""}`} title={item.label} aria-label={item.label}><item.icon /><span>{item.label}</span></NavLink>)}</div>)}</nav>
       <div className="sidebar-footer">
         <div className={`health-pill ${health?.ai_configured ? "healthy" : "warning"}`} title={health?.ai_configured ? `AI 已连接 · ${health.model}` : "AI 未配置，生成操作会明确阻断"}><Activity /><span>{health?.ai_configured ? "AI 已连接" : "AI 未配置"}</span></div>
@@ -57,7 +57,7 @@ export function Shell() {
     </div>
     <ToastRegion />
     <Modal open={resetOpen} title="重置全部演示数据？" onClose={() => setResetOpen(false)} actions={<><button className="secondary-button" onClick={() => setResetOpen(false)}>取消</button><button className="danger-button" onClick={() => { void resetDemo(); setResetOpen(false); }}>确认重置</button></>}>
-      <p>这会清除 V2 的本地修改、审批结果、任务回填和角色设置，并恢复 24 位合成客户。V1 和其他项目数据不会受影响。</p>
+      <p>这会清除 2.1 SQLite 中的合成修改、AI 候选、审批和任务结果，并恢复 24 位合成客户与 200 条黄金集。V1 和其他项目数据不会受影响。</p>
     </Modal>
   </div>;
 }
@@ -71,5 +71,5 @@ function isSectionActive(group: string, pathname: string) {
   if (group === "内容") return pathname.startsWith("/insights") || pathname.startsWith("/content") || pathname.startsWith("/proofs");
   if (group === "客户") return pathname.startsWith("/customers");
   if (group === "执行") return pathname.startsWith("/execution");
-  return pathname.startsWith("/governance");
+  return pathname.startsWith("/governance") || pathname.startsWith("/ai-quality");
 }

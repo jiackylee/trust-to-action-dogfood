@@ -82,7 +82,9 @@ export function Governance() {
 
   return <>
     <SectionHeader eyebrow="治理工作域" title="数据接入与审计" description="当前全部为合成、脱敏数据；接口状态用于验证无权限、延迟和部分失败体验。" actions={<button className="secondary-button" onClick={() => notify({ title: "已发起模拟重试", detail: "游标未变化，未写入任何生产数据。", tone: "info" })}><RefreshCw />重试异常源</button>} />
-    <InlineAlert tone="info" title="独立中国区数据面边界">正式版不会复用东京客户数据库；本地 V2 仅保存合成演示数据。<details className="technical-details"><summary>技术详情</summary><code>trust-to-action-dogfood-v2</code></details></InlineAlert>
+    <InlineAlert tone="info" title="独立中国区数据面边界">正式版不会复用东京客户数据库；2.1 通过本地 SQLite 验证服务端数据与身份边界。<details className="technical-details"><summary>技术详情</summary><code>{health?.data_mode ?? "http-sqlite"}</code></details></InlineAlert>
+    {health?.session_warning && <InlineAlert tone="warning" title="开发会话密钥">{health.session_warning}</InlineAlert>}
+    {health?.ai_configured && !health.fast_model_available && <InlineAlert tone="warning" title="轻量模型不可用">客户评估已进入主模型单路降级，不会将高风险判断降级到低能力模型。</InlineAlert>}
     <div className="governance-grid">
       {state.integrations.map((source) => <section className="integration-row" key={source.id}><div className={`integration-icon integration-${source.status}`}><Database /></div><div className="integration-main"><div><h2>{source.name}</h2><StatusBadge status={source.status} /></div><p>{source.description}</p><dl><div><dt>权限范围</dt><dd>{source.scope}</dd></div><div><dt>最近成功</dt><dd>{source.last_success_at ? formatDate(source.last_success_at) : "从未成功"}</dd></div><div><dt>游标状态</dt><dd><code>{source.cursor}</code></dd></div><div><dt>数据时效</dt><dd>{source.freshness}</dd></div></dl>{source.error && <span className="integration-error"><AlertTriangle />{source.error}</span>}</div><button className="icon-button" aria-label={`重试 ${source.name}`} title="模拟重试" onClick={() => notify({ title: `${source.name} 已加入重试队列`, detail: "演示环境不会请求真实企微接口。", tone: "info" })}><RefreshCw /></button></section>)}
     </div>
@@ -95,6 +97,7 @@ export function Governance() {
         </div>
         <dl className="key-values">
           <div><dt>模型</dt><dd><code>{health?.model ?? "检查中"}</code></dd></div>
+          <div><dt>轻量模型</dt><dd><code>{health?.fast_model ?? "检查中"}</code> · {health?.fast_model_available ? "可用" : "单路降级"}</dd></div>
           <div><dt>配置来源</dt><dd>{health ? SOURCE_LABELS[health.config_source] : "检查中"}</dd></div>
           <div><dt>配置时间</dt><dd>{health?.configured_at ? formatDate(health.configured_at) : "—"}</dd></div>
           <div><dt>敏感日志</dt><dd>不记录密钥、完整提示词、客户片段或模型正文</dd></div>

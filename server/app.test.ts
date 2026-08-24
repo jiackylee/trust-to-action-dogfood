@@ -24,33 +24,89 @@ function service(overrides: Partial<AiService> = {}): AiService {
   };
 }
 
-let server: Server | null = null;
-afterEach(() => new Promise<void>((resolve) => {
-  if (!server) return resolve();
-  const current = server;
-  server = null;
-  current.closeAllConnections?.();
-  current.close(() => resolve());
-}));
+const servers: Server[] = [];
+afterEach(async () => {
+  await Promise.all(servers.splice(0).map((current) => new Promise<void>((resolve) => {
+    current.closeAllConnections?.();
+    current.close(() => resolve());
+  })));
+});
 
-async function call(path: string, options: { body?: unknown; method?: string; headers?: Record<string, string> } = {}, aiService = service()) {
+async function call(path: string, options: { body?: unknown; method?: string; headers?: Record<string, string>; role?: "operations" | "sales" | "lead"; omitCsrf?: boolean; cookie?: string } = {}, aiService = service()) {
   const app = createApp({ aiService });
-  server = app.listen(0, "127.0.0.1");
-  await new Promise<void>((resolve) => server!.once("listening", resolve));
+  const server = app.listen(0, "127.0.0.1");
+  servers.push(server);
+  await new Promise<void>((resolve) => server.once("listening", resolve));
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("test server address missing");
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const bootstrap = await fetch(`${baseUrl}/api/v2/session`);
+  let cookie = options.cookie ?? bootstrap.headers.get("set-cookie")?.split(";")[0] ?? "";
+  let session = await bootstrap.json() as { csrf_token: string };
+  if (options.role && options.role !== "operations") {
+    const switched = await fetch(`${baseUrl}/api/v2/session/demo`, {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie, "x-csrf-token": session.csrf_token },
+      body: JSON.stringify({ role: options.role }),
+    });
+    const switchedBody = await switched.json() as { session: { csrf_token: string } };
+    cookie = switched.headers.get("set-cookie")?.split(";")[0] ?? cookie;
+    session = switchedBody.session;
+  }
   const method = options.method ?? (options.body === undefined ? "GET" : "POST");
-  return fetch(`http://127.0.0.1:${address.port}${path}`, {
+  return fetch(`${baseUrl}${path}`, {
     method,
-    headers: { ...(options.body === undefined ? {} : { "content-type": "application/json" }), ...options.headers },
+    headers: {
+      cookie,
+      ...(options.body === undefined ? {} : { "content-type": "application/json" }),
+      ...(!options.omitCsrf && !["GET", "HEAD", "OPTIONS"].includes(method) ? { "x-csrf-token": session.csrf_token } : {}),
+      ...options.headers,
+    },
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
   });
+}
+
+async function openClient(aiService = service()) {
+  const app = createApp({ aiService });
+  const server = app.listen(0, "127.0.0.1");
+  servers.push(server);
+  await new Promise<void>((resolve) => server.once("listening", resolve));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("test server address missing");
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const bootstrap = await fetch(`${baseUrl}/api/v2/session`);
+  let cookie = bootstrap.headers.get("set-cookie")?.split(";")[0] ?? "";
+  let session = await bootstrap.json() as { csrf_token: string };
+
+  async function request(path: string, options: { body?: unknown; method?: string; headers?: Record<string, string>; omitCsrf?: boolean; cookie?: string } = {}) {
+    const method = options.method ?? (options.body === undefined ? "GET" : "POST");
+    return fetch(`${baseUrl}${path}`, {
+      method,
+      headers: {
+        cookie: options.cookie ?? cookie,
+        ...(options.body === undefined ? {} : { "content-type": "application/json" }),
+        ...(!options.omitCsrf && !["GET", "HEAD", "OPTIONS"].includes(method) ? { "x-csrf-token": session.csrf_token } : {}),
+        ...options.headers,
+      },
+      body: options.body === undefined ? undefined : JSON.stringify(options.body),
+    });
+  }
+
+  async function switchRole(role: "operations" | "sales" | "lead") {
+    const response = await request("/api/v2/session/demo", { body: { role } });
+    const body = await response.json() as { session: { csrf_token: string } };
+    cookie = response.headers.get("set-cookie")?.split(";")[0] ?? cookie;
+    session = body.session;
+    return body;
+  }
+
+  return { request, switchRole };
 }
 
 describe("AI BFF contracts", () => {
   it("returns health without exposing a key", async () => {
     const response = await call("/api/v2/health");
-    expect(await response.json()).toEqual({ ok: true, ai_configured: true, model: "mock-openai", config_source: "environment", configured_at: null });
+    expect(await response.json()).toMatchObject({ ok: true, ai_configured: true, model: "mock-openai", fast_model: "gpt-5.6-terra", data_mode: "http-sqlite", config_source: "environment", configured_at: null });
   });
 
   it("validates and enables an in-memory configuration without echoing the secret", async () => {
@@ -59,7 +115,7 @@ describe("AI BFF contracts", () => {
     const manager = createOpenAiServiceManager({ verify });
     const response = await call("/api/v2/ai/config", {
       body: { api_key: secret, model: "gpt-test" },
-      headers: { "x-tta-local-config": "1", "x-tta-role": "operations" },
+      headers: { "x-tta-local-config": "1" },
     }, manager);
     const serialized = await response.text();
 
@@ -82,7 +138,8 @@ describe("AI BFF contracts", () => {
     const manager = createOpenAiServiceManager({ verify: vi.fn(async () => undefined) });
     const response = await call("/api/v2/ai/config", {
       body: { api_key: "role-test-secret-that-is-long-enough", model: "gpt-test" },
-      headers: { "x-tta-local-config": "1", "x-tta-role": "sales" },
+      headers: { "x-tta-local-config": "1" },
+      role: "sales",
     }, manager);
     expect(response.status).toBe(403);
     expect(await response.json()).toMatchObject({ error: { code: "ROLE_FORBIDDEN" } });
@@ -93,7 +150,8 @@ describe("AI BFF contracts", () => {
     const manager = createOpenAiServiceManager({ apiKey: "environment-test-secret-that-is-long-enough", model: "gpt-env", verify });
     const response = await call("/api/v2/ai/config", {
       body: { api_key: "invalid-test-secret-that-is-long-enough", model: "gpt-next" },
-      headers: { "x-tta-local-config": "1", "x-tta-role": "lead" },
+      headers: { "x-tta-local-config": "1" },
+      role: "lead",
     }, manager);
 
     expect(response.status).toBe(503);
@@ -107,7 +165,7 @@ describe("AI BFF contracts", () => {
     await manager.configure("runtime-test-secret-that-is-long-enough", "gpt-runtime");
     const response = await call("/api/v2/ai/config", {
       method: "DELETE",
-      headers: { "x-tta-local-config": "1", "x-tta-role": "operations" },
+      headers: { "x-tta-local-config": "1" },
     }, manager);
 
     expect(response.status).toBe(200);
@@ -126,6 +184,14 @@ describe("AI BFF contracts", () => {
     const response = await call("/api/v2/ai/weekly-strategy", { body: { metrics: {}, customer_states: {}, drafts: [], proofs: [] } }, ai);
     expect(response.status).toBe(429);
     expect(await response.json()).toMatchObject({ error: { code: "OPENAI_RATE_LIMITED", retryable: true } });
+  });
+
+  it("enforces server-side role permissions for operations AI outputs", async () => {
+    const ai = service();
+    const response = await call("/api/v2/ai/weekly-strategy", { body: { metrics: {}, customer_states: {}, drafts: [], proofs: [] }, role: "sales" }, ai);
+    expect(response.status).toBe(403);
+    expect(await response.json()).toMatchObject({ error: { code: "FORBIDDEN" } });
+    expect(ai.weeklyStrategy).not.toHaveBeenCalled();
   });
 
   it("blocks invalid model strategy ratios", async () => {
@@ -181,5 +247,95 @@ describe("AI BFF contracts", () => {
     const retrospective = await call("/api/v2/ai/weekly-retrospective", { body: { insights: fixture.conversation_insights, briefs: fixture.content_briefs, publications: fixture.publications, outcomes: fixture.content_outcomes } });
     expect(retrospective.status).toBe(200);
     expect(await retrospective.json()).toMatchObject({ data: { caveat: "时间关联，不代表因果" } });
+  });
+
+  it("enforces CSRF and rejects a forged session cookie", async () => {
+    const client = await openClient();
+    const missingCsrf = await client.request("/api/v2/reset", { method: "POST", omitCsrf: true });
+    expect(missingCsrf.status).toBe(403);
+    expect(await missingCsrf.json()).toMatchObject({ error: { code: "CSRF_INVALID" } });
+    const forged = await client.request("/api/v2/reset", { method: "POST", cookie: "tta_demo_session=forged.payload", omitCsrf: true });
+    expect(forged.status).toBe(403);
+    expect(await forged.json()).toMatchObject({ error: { code: "CSRF_INVALID" } });
+  });
+
+  it("projects sales data on the server and redacts operations archive identities", async () => {
+    const client = await openClient();
+    const operationsResponse = await client.request("/api/v2/state");
+    const operations = await operationsResponse.json() as typeof fixture;
+    expect(operations.archived_messages.filter((item) => item.sender === "customer").every((item) => item.sender_name === "客户（已脱敏）")).toBe(true);
+    expect(operations.archive_conversations.every((item) => item.display_name.startsWith("脱敏会话"))).toBe(true);
+
+    await client.switchRole("sales");
+    const salesResponse = await client.request("/api/v2/state");
+    const sales = await salesResponse.json() as typeof fixture;
+    expect(sales.customers.every((item) => item.owner === "陈牧" || item.shared)).toBe(true);
+    expect(sales.evaluation_candidates.every((item) => sales.customers.some((customer) => customer.id === item.customer_id))).toBe(true);
+    expect(sales.evaluation_decisions.every((item) => item.actor === "陈牧")).toBe(true);
+    expect(sales.approvals).toEqual([]);
+  });
+
+  it("returns one persisted candidate per idempotency key", async () => {
+    const ai = service();
+    const client = await openClient(ai);
+    const customer = fixture.customers.find((item) => item.owner === "陈牧")!;
+    const body = { customer_id: customer.id, customer_revision: customer.revision, idempotency_key: "customer-eval-idempotency-test" };
+    const first = await client.request("/api/v2/ai/customer-evaluation", { body });
+    const second = await client.request("/api/v2/ai/customer-evaluation", { body });
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    const firstBody = await first.json() as { candidate: { id: string }; run: { id: string } };
+    const secondBody = await second.json() as typeof firstBody;
+    expect(secondBody).toEqual(firstBody);
+    expect(ai.customerEvaluation).toHaveBeenCalledTimes(1);
+  });
+
+  it("persists and caches a non-retryable policy-blocked generation", async () => {
+    const customer = fixture.customers.find((item) => item.state === "T0")!;
+    const ai = service({ customerEvaluation: vi.fn(async () => ({ data: { ...customer.evaluation!, state_before: "T0" as const, state_after: "D1" as const, evidence_refs: [customer.evidence[0].id] }, meta })) });
+    const client = await openClient(ai);
+    const body = { customer_id: customer.id, customer_revision: customer.revision, idempotency_key: "policy-block-idempotency-test" };
+    const first = await client.request("/api/v2/ai/customer-evaluation", { body });
+    const second = await client.request("/api/v2/ai/customer-evaluation", { body });
+    expect(first.status).toBe(422);
+    expect(second.status).toBe(422);
+    expect(ai.customerEvaluation).toHaveBeenCalledTimes(1);
+    const state = await (await client.request("/api/v2/state")).json() as typeof fixture;
+    expect(state.generation_runs.filter((item) => item.subject_id === customer.id && item.error_code === "POLICY_BLOCKED")).toHaveLength(1);
+  });
+
+  it("allows partial success in a customer batch", async () => {
+    const ai = service();
+    const client = await openClient(ai);
+    const customer = fixture.customers[0];
+    const response = await client.request("/api/v2/ai/customer-evaluations/batch", { body: { customer_ids: [customer.id, "customer-missing"], idempotency_key: "batch-partial-success-test" } });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ results: [{ customer_id: customer.id, candidate: { customer_id: customer.id } }, { customer_id: "customer-missing", error: { code: "NOT_FOUND" } }] });
+    expect(ai.customerEvaluation).toHaveBeenCalledTimes(1);
+  });
+
+  it("requires sales review before writing a generated candidate", async () => {
+    const client = await openClient();
+    const customer = fixture.customers.find((item) => item.owner === "陈牧" && !item.shared)!;
+    const generated = await client.request("/api/v2/ai/customer-evaluation", { body: { customer_id: customer.id, customer_revision: customer.revision, idempotency_key: "candidate-decision-flow-test" } });
+    const { candidate } = await generated.json() as { candidate: { id: string; evaluation: typeof customer.evaluation } };
+    await client.switchRole("sales");
+    const decision = await client.request(`/api/v2/customers/${customer.id}/evaluation-decisions`, { body: { candidate_id: candidate.id, decision: "accepted", evaluation: null, reason_code: null, reason_note: "", expected_revision: customer.revision } });
+    expect(decision.status).toBe(200);
+    expect(await decision.json()).toMatchObject({ customers: expect.arrayContaining([expect.objectContaining({ id: customer.id, state: candidate.evaluation!.state_after })]), evaluation_decisions: expect.arrayContaining([expect.objectContaining({ candidate_id: candidate.id, decision: "accepted" })]) });
+  });
+
+  it("keeps undo snapshots in the BFF instead of accepting a client state payload", async () => {
+    const client = await openClient();
+    await client.switchRole("lead");
+    const stateResponse = await client.request("/api/v2/state");
+    const state = await stateResponse.json() as typeof fixture;
+    const approval = state.approvals.find((item) => item.status === "pending" && item.object_type === "draft")!;
+    const approved = await client.request(`/api/v2/approvals/${approval.id}`, { method: "PUT", body: { decision: "approved", reason: "合约测试批准边界", expected_revision: approval.revision } });
+    expect(approved.status).toBe(200);
+    expect(await approved.json()).toMatchObject({ approvals: expect.arrayContaining([expect.objectContaining({ id: approval.id, status: "approved" })]) });
+    const undone = await client.request("/api/v2/undo", { body: { snapshot: { forged: true } } });
+    expect(undone.status).toBe(200);
+    expect(await undone.json()).toMatchObject({ approvals: expect.arrayContaining([expect.objectContaining({ id: approval.id, status: "pending" })]) });
   });
 });

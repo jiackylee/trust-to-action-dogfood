@@ -1,11 +1,11 @@
 import type { ArchiveConversation, Customer, Role, Task } from "./types";
 
-export type Ability = "generate_strategy" | "edit_draft" | "edit_proof" | "evaluate_customer" | "record_task" | "decide_approval" | "view_governance" | "configure_ai" | "decide_insight" | "manage_brief" | "mark_publish" | "record_content_outcome" | "view_raw_archive";
+export type Ability = "generate_strategy" | "edit_draft" | "edit_proof" | "evaluate_customer" | "review_evaluation" | "record_task" | "decide_approval" | "view_governance" | "view_ai_quality" | "manage_ai_quality" | "publish_ai_version" | "configure_ai" | "decide_insight" | "manage_brief" | "mark_publish" | "record_content_outcome" | "view_raw_archive";
 
 const permissions: Record<Role, ReadonlySet<Ability>> = {
-  operations: new Set(["generate_strategy", "edit_draft", "edit_proof", "evaluate_customer", "view_governance", "configure_ai", "decide_insight", "manage_brief", "mark_publish"]),
-  sales: new Set(["evaluate_customer", "record_task", "view_governance", "record_content_outcome", "view_raw_archive"]),
-  lead: new Set(["evaluate_customer", "decide_approval", "view_governance", "configure_ai", "view_raw_archive"]),
+  operations: new Set(["generate_strategy", "edit_draft", "edit_proof", "evaluate_customer", "view_governance", "view_ai_quality", "manage_ai_quality", "configure_ai", "decide_insight", "manage_brief", "mark_publish"]),
+  sales: new Set(["evaluate_customer", "review_evaluation", "record_task", "view_governance", "view_ai_quality", "record_content_outcome", "view_raw_archive"]),
+  lead: new Set(["evaluate_customer", "decide_approval", "view_governance", "view_ai_quality", "publish_ai_version", "configure_ai", "view_raw_archive"]),
 };
 
 export function can(role: Role, ability: Ability) {

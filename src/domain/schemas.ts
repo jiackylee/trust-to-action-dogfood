@@ -30,6 +30,7 @@ export const EvidenceSchema = z.object({
 export type Evidence = z.infer<typeof EvidenceSchema>;
 
 export const CustomerEvaluationSchema = z.object({
+  decision: z.enum(["recommend", "insufficient_evidence"]),
   objective: z.string().min(1),
   target_segment: z.string().min(1),
   state_before: StateCodeSchema,
@@ -44,6 +45,13 @@ export const CustomerEvaluationSchema = z.object({
   risk_flags: z.array(z.string()),
   approval_required: z.boolean(),
   next_review_at: z.string(),
+  evidence_assessment: z.array(z.object({
+    evidence_id: z.string(),
+    supports: z.enum(["state", "nba", "both", "neither"]),
+    weight: EvidenceStrengthSchema,
+    summary: z.string(),
+  })).min(1),
+  uncertainties: z.array(z.string()).max(5),
 });
 export type CustomerEvaluation = z.infer<typeof CustomerEvaluationSchema>;
 
@@ -133,6 +141,14 @@ export const AiMetaSchema = z.object({
   response_id: z.string(),
   prompt_version: z.string(),
   generated_at: z.string(),
+  router_version: z.string().optional(),
+  route_reason: z.string().optional(),
+  attempts: z.number().int().min(1).optional(),
+  latency_ms: z.number().int().min(0).optional(),
+  input_tokens: z.number().int().min(0).optional(),
+  output_tokens: z.number().int().min(0).optional(),
+  escalated_from: z.string().nullable().optional(),
+  input_fingerprint: z.string().optional(),
 });
 export type AiMeta = z.infer<typeof AiMetaSchema>;
 
