@@ -1,4 +1,10 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
+
+async function switchRole(page: Page, role: "运营" | "销售" | "负责人") {
+  await page.locator(".role-button").click();
+  await page.getByRole("menuitemradio").filter({ hasText: role }).click();
+  await expect(page.locator(".role-button")).toContainText(role);
+}
 
 test.beforeEach(async ({ page }) => {
   await page.goto("/");
@@ -42,14 +48,12 @@ for (const viewport of [{ width: 1440, height: 900 }, { width: 1024, height: 768
     if (viewport.width === 390) {
       await expect(page.locator(".desktop-authoring")).toBeHidden();
       await expect(page.getByText("营销脑哈希对比、黄金集管理和模型路由编辑在桌面端开放；移动端仍可查看质量指标。")).toBeVisible();
-      await page.locator(".role-button").click();
-      await page.getByRole("menuitemradio").filter({ hasText: "销售" }).click();
+      await switchRole(page, "销售");
       await page.goto("/customers");
       await page.locator(".customer-cards .mobile-card").first().getByRole("link").click();
       await expect(page.getByRole("button", { name: "原样采用并写入" })).toBeVisible();
       expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1);
-      await page.locator(".role-button").click();
-      await page.getByRole("menuitemradio").filter({ hasText: "运营" }).click();
+      await switchRole(page, "运营");
       await page.goto("/content?draft=draft-07");
       await page.getByRole("button", { name: "审阅 AI 候选" }).click();
       await expect(page.locator(".marketing-decision-panel")).toContainText("知识依据");
@@ -74,8 +78,7 @@ test("customer context, first-screen NBA and blocked AI retry", async ({ page })
 
 test("lead approves sensitive content and can undo", async ({ page }) => {
   await page.goto("/execution?tab=approvals");
-  await page.locator(".role-button").click();
-  await page.getByRole("menuitemradio").filter({ hasText: "负责人" }).click();
+  await switchRole(page, "负责人");
   const approval = page.locator(".approval-pending").first();
   await approval.getByPlaceholder("说明批准边界或退回原因").fill("仅允许销售场景，保留 14 天观察期说明");
   await approval.getByRole("button", { name: "批准" }).click();
@@ -86,8 +89,7 @@ test("lead approves sensitive content and can undo", async ({ page }) => {
 
 test("sales accepts the next best action and reaches the linked task", async ({ page }) => {
   await page.goto("/customers");
-  await page.locator(".role-button").click();
-  await page.getByRole("menuitemradio").filter({ hasText: "销售" }).click();
+  await switchRole(page, "销售");
   await expect(page.getByLabel("按负责人筛选")).toHaveValue("陈牧");
   await page.locator(".customer-name").first().click();
   await page.getByRole("button", { name: "采纳并建任务" }).click();
@@ -197,9 +199,7 @@ test("lead must explicitly confirm live Holdout usage", async ({ page }) => {
     });
   });
   await page.reload();
-  await page.locator(".role-button").click();
-  await page.getByRole("menuitemradio").filter({ hasText: "负责人" }).click();
-  await expect(page.locator(".role-button")).toContainText("负责人");
+  await switchRole(page, "负责人");
   await page.goto("/ai-quality");
   await page.getByRole("button", { name: "启动真实运行" }).click();
   const dialog = page.getByRole("dialog", { name: "确认真实 Holdout API 用量" });
@@ -245,8 +245,7 @@ test("knowledge-grounded content loop reaches retrospective without automatic se
   const latestPublication = page.locator(".publication-card").first();
   await latestPublication.getByRole("button", { name: "同步合成互动" }).click();
   await expect(page.getByText("合成互动已同步", { exact: true })).toBeVisible();
-  await page.locator(".role-button").click();
-  await page.getByRole("menuitemradio").filter({ hasText: "销售" }).click();
+  await switchRole(page, "销售");
   await page.getByLabel("结果事实").fill("客户主动咨询实施清单并预约 Demo");
   await page.getByRole("button", { name: "保存业务结果" }).click();
   await expect(page.getByText("业务结果已回填", { exact: true })).toBeVisible();
@@ -259,8 +258,7 @@ test("knowledge-grounded content loop reaches retrospective without automatic se
 test("raw message access is absent for operations and audited for owned sales conversations", async ({ page }) => {
   await page.goto("/insights");
   await expect(page.getByRole("button", { name: /查看 conv-.* 原文/ })).toHaveCount(0);
-  await page.locator(".role-button").click();
-  await page.getByRole("menuitemradio").filter({ hasText: "销售" }).click();
+  await switchRole(page, "销售");
   const rawButton = page.getByRole("button", { name: /查看 conv-.* 原文/ }).first();
   await rawButton.click();
   await page.getByLabel("访问用途").selectOption({ label: "确认销售洞察" });
@@ -272,8 +270,7 @@ test("raw message access is absent for operations and audited for owned sales co
 });
 
 test("sales adopts an AI candidate and records its seven-day review", async ({ page }) => {
-  await page.locator(".role-button").click();
-  await page.getByRole("menuitemradio").filter({ hasText: "销售" }).click();
+  await switchRole(page, "销售");
   await page.goto("/customers");
   await page.getByText("待销售判断", { exact: true }).first().click();
   await expect(page.locator(".evaluation-candidate-panel")).toBeInViewport();
@@ -288,8 +285,7 @@ test("sales adopts an AI candidate and records its seven-day review", async ({ p
 });
 
 test("sales can modify a candidate with a structured reason", async ({ page }) => {
-  await page.locator(".role-button").click();
-  await page.getByRole("menuitemradio").filter({ hasText: "销售" }).click();
+  await switchRole(page, "销售");
   await page.goto("/customers");
   await page.getByText("待销售判断", { exact: true }).first().click();
   await page.getByRole("button", { name: "修改后采用" }).click();
@@ -299,8 +295,7 @@ test("sales can modify a candidate with a structured reason", async ({ page }) =
 });
 
 test("sales can reject a candidate without losing the selected reason", async ({ page }) => {
-  await page.locator(".role-button").click();
-  await page.getByRole("menuitemradio").filter({ hasText: "销售" }).click();
+  await switchRole(page, "销售");
   await page.goto("/customers");
   await page.getByText("待销售判断", { exact: true }).first().click();
   await page.locator(".evaluation-candidate-panel").getByRole("button", { name: "拒绝", exact: true }).click();
@@ -318,8 +313,7 @@ test("operations evaluates a code-bound marketing brain and lead publishes then 
   await expect(page.getByText("黄金集评测已完成", { exact: true })).toBeVisible();
   await expect(page.getByText("全部门槛通过", { exact: true })).toBeVisible();
 
-  await page.locator(".role-button").click();
-  await page.getByRole("menuitemradio").filter({ hasText: "负责人" }).click();
+  await switchRole(page, "负责人");
   const brainPanel = page.locator(".version-panel").filter({ hasText: "营销脑版本" });
   const candidateRow = brainPanel.locator(".version-row").filter({ hasText: "营销大脑 2.2-RC2" });
   await candidateRow.getByRole("button", { name: "发布" }).click();
