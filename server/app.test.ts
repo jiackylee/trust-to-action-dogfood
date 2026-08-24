@@ -17,6 +17,9 @@ function service(overrides: Partial<AiService> = {}): AiService {
     contentDraft: vi.fn(async () => ({ data: { title: "草稿", stage: "T" as const, target_segment: "T0", objective: "建立信任", body: "正文", cta: "查看清单", expected_transition: "T0 → T1", evidence_refs: [], risk_flags: [], approval_required: false }, meta })),
     riskReview: vi.fn(async () => ({ data: { summary: "通过", risk_flags: [], claims: [], approval_recommended: false, suggested_revision: "" }, meta })),
     customerEvaluation: vi.fn(async (input: unknown) => { const { customer } = input as { customer: typeof fixture.customers[number] }; return { data: { ...customer.evaluation!, state_before: customer.state, state_after: customer.state, evidence_refs: [customer.evidence[0].id] }, meta }; }),
+    conversationInsights: vi.fn(async () => ({ data: { insights: [{ title: "流程失控", category: "问题" as const, signal_type: "跟进遗漏", customer_segment: "销售团队", summary: "缺少统一跟进记录。", redacted_quotes: ["跟进主要依赖个人记录。"], message_refs: ["message-01-3"], conversation_refs: ["conv-01"], confidence: 82, evidence_strength: "medium" as const, recommended_angle: "建立最小跟进闭环" }], excluded_message_count: 0, analysis_note: "仅使用有效脱敏消息" }, meta })),
+    contentBrief: vi.fn(async () => ({ data: { title: "最小跟进闭环", target_segment: "销售团队", stage: "T" as const, primary_angle: "不用增加字段也能开始", key_facts: ["统一负责人和复查时间"], proof_requirements: [], cta: "回复清单", due_at: "2026-08-25T10:00:00+08:00", insight_refs: ["insight-01"] }, meta })),
+    weeklyRetrospective: vi.fn(async () => ({ data: fixture.weekly_retrospective.retrospective, meta })),
     ...overrides,
   };
 }
@@ -139,5 +142,44 @@ describe("AI BFF contracts", () => {
     const response = await call("/api/v2/ai/customer-evaluation", { body: { customer } }, ai);
     expect(response.status).toBe(422);
     expect(await response.json()).toMatchObject({ error: { code: "POLICY_BLOCKED" } });
+  });
+
+  it("filters archive input and returns structured conversation insights", async () => {
+    const messages = fixture.archived_messages.filter((item) => item.conversation_id === "conv-01");
+    const consents = fixture.archive_consents.filter((item) => item.conversation_id === "conv-01");
+    const ai = service();
+    const response = await call("/api/v2/ai/conversation-insights", { body: { messages, consents } }, ai);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ data: { insights: [{ message_refs: ["message-01-3"] }] }, meta: { response_id: "resp_test" } });
+    expect(ai.conversationInsights).toHaveBeenCalledWith(expect.objectContaining({ messages: expect.arrayContaining([expect.objectContaining({ id: "message-01-3", redacted_text: expect.any(String) })]) }));
+  });
+
+  it("blocks unconsented archive analysis and unknown model references", async () => {
+    const withdrawnMessages = fixture.archived_messages.filter((item) => item.conversation_id === "conv-09");
+    const withdrawnConsent = fixture.archive_consents.filter((item) => item.conversation_id === "conv-09");
+    const blocked = await call("/api/v2/ai/conversation-insights", { body: { messages: withdrawnMessages, consents: withdrawnConsent } });
+    expect(blocked.status).toBe(422);
+    expect(await blocked.json()).toMatchObject({ error: { code: "PRIVACY_POLICY_BLOCKED" } });
+
+    const messages = fixture.archived_messages.filter((item) => item.conversation_id === "conv-01");
+    const consents = fixture.archive_consents.filter((item) => item.conversation_id === "conv-01");
+    const ai = service({ conversationInsights: vi.fn(async () => ({ data: { insights: [{ title: "越权引用", category: "问题" as const, signal_type: "测试", customer_segment: "测试", summary: "测试", redacted_quotes: ["测试"], message_refs: ["message-unknown"], conversation_refs: ["conv-01"], confidence: 90, evidence_strength: "strong" as const, recommended_angle: "测试" }], excluded_message_count: 0, analysis_note: "" }, meta })) });
+    const unknown = await call("/api/v2/ai/conversation-insights", { body: { messages, consents } }, ai);
+    expect(unknown.status).toBe(422);
+    expect(await unknown.json()).toMatchObject({ error: { code: "UNKNOWN_ARCHIVE_REFERENCE" } });
+  });
+
+  it("allows Briefs only from accepted insights and returns a causal caveat in retrospectives", async () => {
+    const accepted = fixture.conversation_insights.find((item) => item.status === "accepted")!;
+    const brief = await call("/api/v2/ai/content-brief", { body: { accepted_insights: [accepted], historical_outcomes: fixture.content_outcomes } });
+    expect(brief.status).toBe(200);
+    const dismissed = fixture.conversation_insights.find((item) => item.status === "dismissed")!;
+    const blocked = await call("/api/v2/ai/content-brief", { body: { accepted_insights: [dismissed], historical_outcomes: [] } });
+    expect(blocked.status).toBe(422);
+    expect(await blocked.json()).toMatchObject({ error: { code: "INSIGHT_NOT_ACCEPTED" } });
+
+    const retrospective = await call("/api/v2/ai/weekly-retrospective", { body: { insights: fixture.conversation_insights, briefs: fixture.content_briefs, publications: fixture.publications, outcomes: fixture.content_outcomes } });
+    expect(retrospective.status).toBe(200);
+    expect(await retrospective.json()).toMatchObject({ data: { caveat: "时间关联，不代表因果" } });
   });
 });

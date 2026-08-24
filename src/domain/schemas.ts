@@ -83,6 +83,51 @@ export const RiskReviewSchema = z.object({
 });
 export type RiskReview = z.infer<typeof RiskReviewSchema>;
 
+export const ConversationInsightProposalSchema = z.object({
+  title: z.string().min(1),
+  category: z.enum(["问题", "异议", "期望结果", "购买信号"]),
+  signal_type: z.string().min(1),
+  customer_segment: z.string().min(1),
+  summary: z.string().min(1),
+  redacted_quotes: z.array(z.string()).min(1).max(5),
+  message_refs: z.array(z.string()).min(1),
+  conversation_refs: z.array(z.string()).min(1),
+  confidence: z.number().int().min(0).max(100),
+  evidence_strength: EvidenceStrengthSchema,
+  recommended_angle: z.string().min(1),
+});
+export type ConversationInsightProposal = z.infer<typeof ConversationInsightProposalSchema>;
+
+export const ConversationInsightsSchema = z.object({
+  insights: z.array(ConversationInsightProposalSchema).min(1).max(20),
+  excluded_message_count: z.number().int().min(0),
+  analysis_note: z.string(),
+});
+export type ConversationInsights = z.infer<typeof ConversationInsightsSchema>;
+
+export const ContentBriefProposalSchema = z.object({
+  title: z.string().min(1),
+  target_segment: z.string().min(1),
+  stage: z.enum(["T", "I", "D", "A"]),
+  primary_angle: z.string().min(1),
+  key_facts: z.array(z.string()).min(1).max(6),
+  proof_requirements: z.array(z.string()).max(6),
+  cta: z.string().min(1),
+  due_at: z.string(),
+  insight_refs: z.array(z.string()).min(1),
+});
+export type ContentBriefProposal = z.infer<typeof ContentBriefProposalSchema>;
+
+export const WeeklyRetrospectiveSchema = z.object({
+  week_label: z.string().min(1),
+  summary: z.string().min(1),
+  top_themes: z.array(z.object({ theme: z.string(), reason: z.string(), business_results: z.number().int().min(0) })).max(5),
+  bottlenecks: z.array(z.string()).max(6),
+  next_week_candidates: z.array(z.object({ theme: z.string(), objective: z.string(), evidence_refs: z.array(z.string()) })).min(1).max(6),
+  caveat: z.literal("时间关联，不代表因果"),
+});
+export type WeeklyRetrospective = z.infer<typeof WeeklyRetrospectiveSchema>;
+
 export const AiMetaSchema = z.object({
   model: z.string(),
   response_id: z.string(),

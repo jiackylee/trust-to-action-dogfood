@@ -1,4 +1,4 @@
-import { ArrowRight, CheckCircle2, Clock3, FileWarning, ShieldAlert, TrendingUp, Unplug, Users } from "lucide-react";
+import { ArrowRight, BarChart3, BookOpenCheck, CheckCircle2, Clock3, FileWarning, MessageSquareText, Send, ShieldAlert, TrendingUp, Unplug, Users } from "lucide-react";
 import { Link } from "react-router-dom";
 import { LoadingState, SectionHeader, StatusBadge } from "../components/UI";
 import { actorForRole } from "../domain/permissions";
@@ -16,18 +16,18 @@ export function Dashboard() {
 function OperationsDashboard({ state }: { state: DomainState }) {
   const readyDrafts = state.drafts.filter((draft) => draft.status === "ready").length;
   const pendingApprovals = state.approvals.filter((item) => item.status === "pending").length;
-  const overdueTasks = state.tasks.filter((item) => item.status !== "done" && new Date(item.due_at).getTime() < Date.now()).length;
-  const highIntent = state.customers.filter((item) => ["D1", "A1", "C1"].includes(item.state)).length;
+  const pendingInsights = state.conversation_insights.filter((item) => item.status === "candidate").length;
+  const acceptedWithoutBrief = state.conversation_insights.filter((item) => item.status === "accepted" && !item.brief_id).length;
   const evidenceGaps = state.proofs.filter((item) => item.status !== "usable").length;
-  const problems = state.integrations.filter((item) => item.status !== "healthy").length;
+  const waitingResults = state.publications.filter((item) => item.status === "published" || !state.content_outcomes.some((outcome) => outcome.publication_id === item.id)).length;
   const gapProof = state.proofs.filter((item) => item.status !== "usable").sort((a, b) => a.completeness - b.completeness)[0];
   const pendingApproval = state.approvals.filter((item) => item.status === "pending").sort((a, b) => a.due_at.localeCompare(b.due_at))[0];
-  const unhealthySource = state.integrations.find((item) => item.status !== "healthy");
+  const candidateInsight = state.conversation_insights.find((item) => item.status === "candidate");
   const blockers = [
+    candidateInsight && { title: candidateInsight.title, detail: `${candidateInsight.distinct_conversation_count} 个独立会话 · ${candidateInsight.confidence}% 置信度`, tone: "warning", to: "/insights?status=candidate", action: "判断洞察" },
     gapProof && { title: gapProof.title, detail: `${gapProof.completeness}% 完整 · ${gapProof.missing_fields.join("、") || "授权不可用"}`, tone: "danger", to: `/proofs?proof=${gapProof.id}`, action: "补齐证明" },
     pendingApproval && { title: pendingApproval.title, detail: `${pendingApproval.type} · ${formatDate(pendingApproval.due_at)} 截止`, tone: "warning", to: "/execution?tab=approvals", action: "处理审批" },
-    unhealthySource && { title: unhealthySource.name, detail: unhealthySource.error || `${unhealthySource.freshness}未更新`, tone: "warning", to: "/governance", action: "检查数据" },
-  ].filter(Boolean) as Array<{ title: string; detail: string; tone: string; to: string; action: string }>;
+  ].filter(Boolean).slice(0, 3) as Array<{ title: string; detail: string; tone: string; to: string; action: string }>;
   const ratios = state.weekly_plan.strategy.ratio;
   const totalDrafts = state.drafts.length || 1;
   const stagePlan = [
@@ -35,19 +35,19 @@ function OperationsDashboard({ state }: { state: DomainState }) {
   ] as const;
 
   return <>
-    <SectionHeader eyebrow={`第 ${state.week} 周`} title="本周经营台" description="从证据缺口和审批阻塞开始，优先处理会影响客户推进的工作。" actions={<Link className="primary-button" to="/weekly">进入本周运营 <ArrowRight /></Link>} />
+    <SectionHeader eyebrow={`第 ${state.week} 周`} title="内容经营台" description="从待判断会话信号开始，推动内容进入可人工发布和结果回填。" actions={<Link className="primary-button" to="/insights?status=candidate">处理会话洞察 <ArrowRight /></Link>} />
     <section className="focus-band" aria-labelledby="weekly-theme">
       <div><span className="eyebrow">本周主题</span><h2 id="weekly-theme">{state.weekly_plan.strategy.theme}</h2><p>{state.weekly_plan.strategy.objective}</p></div>
-      <div className="gate"><span>核心门禁</span><strong>24h</strong><small>有效信号 → 下一动作</small></div>
+      <div className="gate"><span>北极星指标</span><strong>≤15m</strong><small>有效洞察 → 朋友圈就绪草稿</small></div>
       <div className="readiness"><span>内容就绪度</span><strong>{Math.round((readyDrafts / totalDrafts) * 100)}%</strong><div className="progress"><i style={{ width: `${(readyDrafts / totalDrafts) * 100}%` }} /></div><small>{readyDrafts}/{state.drafts.length} 条可人工发布</small></div>
     </section>
     <section className="metrics-grid" aria-label="核心经营指标">
-      <Metric icon={<CheckCircle2 />} label="就绪内容" value={`${readyDrafts} 条`} note={`本周共 ${state.drafts.length} 条`} to="/content?status=ready" tone="success" />
-      <Metric icon={<TrendingUp />} label="高意向状态" value={`${highIntent} 位`} note="D1 / A1 / C1" to="/customers?states=D1,A1,C1" />
+      <Metric icon={<MessageSquareText />} label="待判断洞察" value={`${pendingInsights} 条`} note="接受、编辑或忽略" to="/insights?status=candidate" tone="warning" />
+      <Metric icon={<BookOpenCheck />} label="待生成 Brief" value={`${acceptedWithoutBrief} 条`} note="只使用已接受洞察" to="/insights?status=accepted" />
       <Metric icon={<FileWarning />} label="证据缺口" value={`${evidenceGaps} 项`} note={`${state.proofs.filter((item) => item.status === "revoked").length} 项已撤权`} to="/proofs?readiness=gap" tone="danger" />
       <Metric icon={<ShieldAlert />} label="待审批" value={`${pendingApprovals} 项`} note={`${state.approvals.filter((item) => item.status === "pending" && new Date(item.due_at).getTime() < Date.now() + 24 * 60 * 60_000).length} 项 24h 内到期`} to="/execution?tab=approvals" tone="warning" />
-      <Metric icon={<Clock3 />} label="逾期动作" value={`${overdueTasks} 项`} note="优先回填结果" to="/execution?tab=tasks" tone="danger" />
-      <Metric icon={<Unplug />} label="数据异常" value={`${problems} 源`} note={`${state.integrations.length - problems} 源正常`} to="/governance" tone="warning" />
+      <Metric icon={<Send />} label="待人工发布" value={`${readyDrafts} 条`} note="复制后手动标记发布" to="/content?view=drafts&status=ready" tone="success" />
+      <Metric icon={<BarChart3 />} label="待回填结果" value={`${waitingResults} 条`} note="平台互动与业务结果分层" to="/content?view=results" tone="warning" />
     </section>
     <div className="dashboard-lower">
       <section className="panel blockers-panel"><div className="panel-heading"><div><span className="eyebrow">优先队列</span><h2>前三个阻塞点</h2></div><span className="count-badge">{blockers.length}</span></div>
@@ -56,8 +56,8 @@ function OperationsDashboard({ state }: { state: DomainState }) {
       <section className="panel"><div className="panel-heading"><div><span className="eyebrow">内容组合</span><h2>T / I / D / A 进度</h2></div><Link to="/content">查看本周全部草稿</Link></div>
         <div className="stage-progress">{stagePlan.map(([code, label, ratio]) => { const target = Math.max(1, Math.round(totalDrafts * ratio / 100)); const done = state.drafts.filter((item) => item.stage === code && item.status === "ready").length; return <div className="stage-row" key={code}><span className={`stage-code stage-${code.toLowerCase()}`}>{code}</span><span><b>{label}</b><small>{ratio}% 策略配比</small></span><div className="segmented-progress">{Array.from({ length: target }, (_, index) => <i className={index < done ? "filled" : ""} key={index} />)}</div><strong>{done}/{target}</strong></div>; })}</div>
       </section>
-      <section className="panel data-panel"><div className="panel-heading"><div><span className="eyebrow">同步健康</span><h2>企微数据面</h2></div><Link to="/governance">查看数据与审计</Link></div>
-        {state.integrations.map((source) => <div className="source-mini" key={source.id}><span><strong>{source.name}</strong><small>{source.freshness}</small></span><StatusBadge status={source.status} /></div>)}
+      <section className="panel data-panel"><div className="panel-heading"><div><span className="eyebrow">本周高表现主题</span><h2>{state.weekly_retrospective.retrospective.top_themes[0]?.theme ?? "等待结果"}</h2></div><Link to="/weekly?view=retrospective">查看周复盘</Link></div>
+        <p>{state.weekly_retrospective.retrospective.top_themes[0]?.reason ?? "发布结果不足，暂不形成主题判断。"}</p><div className="causality-note">时间关联，不代表因果</div>
       </section>
     </div>
   </>;

@@ -1,8 +1,8 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import { aiClient, AiClientError, type AiHealth } from "../data/ai-client";
 import { createDataClient } from "../data/client";
-import type { AiMeta, CustomerEvaluation, WeeklyStrategy } from "../domain/schemas";
-import type { ApiProblem, DomainState, Draft, NbaDecision, Proof, ProofCore, Role } from "../domain/types";
+import type { AiMeta, CustomerEvaluation, WeeklyRetrospective, WeeklyStrategy } from "../domain/schemas";
+import type { ApiProblem, ContentBrief, ContentOutcome, ConversationInsight, DomainState, Draft, NbaDecision, Proof, ProofCore, Role } from "../domain/types";
 
 const dataClient = createDataClient();
 
@@ -34,6 +34,13 @@ interface StoreValue {
   addCustomerNote(customerId: string, text: string, expectedRevision: number): Promise<void>;
   decideApproval(id: string, decision: "approved" | "returned", reason: string, expectedRevision: number): Promise<void>;
   recordTaskOutcome(id: string, outcome: string, expectedRevision: number): Promise<void>;
+  decideInsight(id: string, decision: "accepted" | "dismissed", reason: string, edits: Partial<Pick<ConversationInsight, "title" | "summary" | "customer_segment">>, expectedRevision: number): Promise<void>;
+  saveBrief(brief: ContentBrief, expectedRevision: number): Promise<void>;
+  recordRawAccess(conversationId: string, purpose: string): Promise<void>;
+  markPublished(draftId: string, expectedRevision: number): Promise<void>;
+  syncPublicationResults(id: string, expectedRevision: number): Promise<void>;
+  recordContentOutcome(publicationId: string, type: ContentOutcome["type"], detail: string, customerId: string | null): Promise<void>;
+  saveWeeklyRetrospective(retrospective: WeeklyRetrospective, meta: AiMeta | null, generatedBy: string, expectedRevision: number): Promise<void>;
   resetDemo(): Promise<void>;
   reload(): Promise<void>;
   refreshHealth(): Promise<void>;
@@ -157,6 +164,34 @@ export function AppStore({ children }: { children: ReactNode }) {
         actionLabel: "撤销",
         onAction: snapshot ? async () => { setState(await dataClient.restoreSnapshot(snapshot)); notify({ title: "已撤销", tone: "info" }); } : undefined,
       });
+    },
+    async decideInsight(id, decision, reason, edits, expectedRevision) {
+      await update(() => dataClient.decideInsight(id, decision, reason, edits, expectedRevision));
+      notify({ title: decision === "accepted" ? "洞察已接受" : "洞察已忽略", detail: decision === "accepted" ? "现在可以生成或采用内容 Brief。" : "判断原因已进入审计。", tone: "success" });
+    },
+    async saveBrief(brief, expectedRevision) {
+      await update(() => dataClient.saveBrief(brief, expectedRevision));
+      notify({ title: "内容 Brief 已采用", detail: "洞察血缘、唯一 CTA 和截止时间已固定。", tone: "success" });
+    },
+    async recordRawAccess(conversationId, purpose) {
+      await update(() => dataClient.recordRawAccess(conversationId, purpose));
+    },
+    async markPublished(draftId, expectedRevision) {
+      const snapshot = state;
+      await update(() => dataClient.markPublished(draftId, expectedRevision));
+      notify({ title: "已标记人工发布", detail: "系统未调用任何发送接口；7 秒内可撤销。", tone: "success", actionLabel: "撤销", onAction: snapshot ? async () => { setState(await dataClient.restoreSnapshot(snapshot)); } : undefined });
+    },
+    async syncPublicationResults(id, expectedRevision) {
+      await update(() => dataClient.syncPublicationResults(id, expectedRevision));
+      notify({ title: "合成互动已同步", detail: "点赞和评论仅作为平台弱信号展示。", tone: "success" });
+    },
+    async recordContentOutcome(publicationId, type, detail, customerId) {
+      await update(() => dataClient.recordContentOutcome(publicationId, type, detail, customerId));
+      notify({ title: "业务结果已回填", detail: "已与平台互动分层记录。", tone: "success" });
+    },
+    async saveWeeklyRetrospective(retrospective, meta, generatedBy, expectedRevision) {
+      await update(() => dataClient.saveWeeklyRetrospective(retrospective, meta, generatedBy, expectedRevision));
+      notify({ title: "周复盘已更新", detail: "下周主题候选已生成，时间关联不代表因果。", tone: "success" });
     },
     async resetDemo() {
       await update(() => dataClient.reset());

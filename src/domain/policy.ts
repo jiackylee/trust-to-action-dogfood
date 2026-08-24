@@ -1,5 +1,5 @@
 import { STATE_ORDER, type CustomerEvaluation } from "./schemas";
-import type { Customer, Draft, Proof } from "./types";
+import type { ArchiveConsent, ArchivedMessage, ConversationInsight, Customer, Draft, Proof } from "./types";
 
 export interface PolicyDecision {
   allowed: boolean;
@@ -72,4 +72,41 @@ export function proofCompleteness(proof: Pick<Proof, "redacted_quote" | "process
 
 export function proofIsUsable(proof: Pick<Proof, "status" | "expires_at" | "authorization">, at = new Date()) {
   return proof.status === "usable" && proof.authorization.length > 0 && new Date(proof.expires_at).getTime() >= at.getTime();
+}
+
+const phonePattern = /(?<!\d)1[3-9]\d{9}(?!\d)/gu;
+const emailPattern = /[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/gu;
+const wechatPattern = /(?:微信|wx|wechat)[:：\s]*[A-Za-z][-_A-Za-z0-9]{5,19}/giu;
+const idCardPattern = /(?<!\d)\d{17}[\dXx](?!\d)/gu;
+
+export function redactArchiveText(text: string) {
+  return text.replace(phonePattern, "[手机号已脱敏]").replace(emailPattern, "[邮箱已脱敏]").replace(wechatPattern, "[微信号已脱敏]").replace(idCardPattern, "[证件号已脱敏]");
+}
+
+export function archiveMessageEligibility(message: ArchivedMessage, consent: ArchiveConsent | undefined, at = new Date("2026-08-24T12:00:00+08:00")) {
+  const reasons: string[] = [];
+  if (consent?.status !== "agreed") reasons.push("未获得有效会话存档同意");
+  if (message.recalled) reasons.push("消息已撤回");
+  if (message.duplicate_of) reasons.push("重复消息");
+  if (message.decrypt_status !== "ok") reasons.push("消息解密失败");
+  if (!message.text && !message.link_description) reasons.push("媒体仅保留元数据");
+  if (at.getTime() - new Date(message.sent_at).getTime() > 5 * 24 * 60 * 60_000) reasons.push("超出 5 天补拉窗口");
+  return { eligible: reasons.length === 0, reasons, redacted_text: reasons.length ? null : redactArchiveText(message.text ?? message.link_description ?? "") };
+}
+
+export function insightTrendScope(conversationRefs: string[]) {
+  return new Set(conversationRefs).size >= 3 ? "trend" as const : "individual" as const;
+}
+
+export function validateInsightLineage(insight: Pick<ConversationInsight, "message_refs" | "conversation_refs">, messages: ArchivedMessage[], consents: ArchiveConsent[]) {
+  const reasons: string[] = [];
+  const referenced = insight.message_refs.map((id) => messages.find((message) => message.id === id));
+  if (referenced.some((message) => !message)) reasons.push("存在未知消息引用");
+  for (const message of referenced) {
+    if (!message) continue;
+    const consent = consents.find((item) => item.conversation_id === message.conversation_id);
+    if (!archiveMessageEligibility(message, consent).eligible) reasons.push(`${message.id} 不符合分析门禁`);
+    if (!insight.conversation_refs.includes(message.conversation_id)) reasons.push(`${message.id} 的会话血缘缺失`);
+  }
+  return { allowed: reasons.length === 0, code: reasons.length ? "INSIGHT_LINEAGE_BLOCKED" : "OK", reasons };
 }

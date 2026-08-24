@@ -1,13 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import { NavLink, Outlet, useLocation } from "react-router-dom";
-import { Activity, BookOpenCheck, BriefcaseBusiness, ChevronDown, CircleUserRound, Database, FileText, Gauge, Library, ListChecks, RotateCcw, Settings2, ShieldCheck, Sparkles, Users } from "lucide-react";
+import { Activity, BriefcaseBusiness, ChevronDown, CircleUserRound, FileText, Gauge, Library, ListChecks, MessageSquareText, RotateCcw, ShieldCheck, Sparkles, Users } from "lucide-react";
 import { Modal, ToastRegion } from "./UI";
 import { useAppStore } from "../store/AppStore";
 import type { Role } from "../domain/types";
 
 const nav = [
   { group: "经营", items: [{ to: "/", label: "本周经营台", icon: Gauge }, { to: "/weekly", label: "本周运营", icon: BriefcaseBusiness }] },
-  { group: "内容", items: [{ to: "/content", label: "策略与草稿", icon: FileText }, { to: "/proofs", label: "证明资产", icon: Library }] },
+  { group: "内容", items: [{ to: "/insights", label: "会话洞察", icon: MessageSquareText }, { to: "/content", label: "草稿与发布", icon: FileText }, { to: "/proofs", label: "证明资产", icon: Library }] },
   { group: "客户", items: [{ to: "/customers", label: "客户状态", icon: Users }] },
   { group: "执行", items: [{ to: "/execution", label: "任务与审批", icon: ListChecks }] },
   { group: "治理", items: [{ to: "/governance", label: "数据与审计", icon: ShieldCheck }] },
@@ -68,7 +68,7 @@ function pageTitle(pathname: string) {
 
 function isSectionActive(group: string, pathname: string) {
   if (group === "经营") return pathname === "/" || pathname.startsWith("/weekly");
-  if (group === "内容") return pathname.startsWith("/content") || pathname.startsWith("/proofs");
+  if (group === "内容") return pathname.startsWith("/insights") || pathname.startsWith("/content") || pathname.startsWith("/proofs");
   if (group === "客户") return pathname.startsWith("/customers");
   if (group === "执行") return pathname.startsWith("/execution");
   return pathname.startsWith("/governance");

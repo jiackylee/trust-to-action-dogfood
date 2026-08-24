@@ -12,7 +12,8 @@ describe("operating dashboard", () => {
 
   it("links metrics directly to filtered work queues", async () => {
     render(<MemoryRouter><AppStore><Dashboard /></AppStore></MemoryRouter>);
-    await screen.findByRole("heading", { name: "本周经营台" });
+    await screen.findByRole("heading", { name: "内容经营台" });
+    expect(screen.getByText("待判断洞察").closest("a")).toHaveAttribute("href", "/insights?status=candidate");
     expect(screen.getByText("待审批").closest("a")).toHaveAttribute("href", "/execution?tab=approvals");
     expect(screen.getByText("证据缺口").closest("a")).toHaveAttribute("href", "/proofs?readiness=gap");
     await waitFor(() => expect(localStorage.getItem("trust-to-action-dogfood-v2")).toBeNull());

@@ -1,11 +1,11 @@
 import { createFixtureState } from "../domain/fixtures";
-import { actorForRole, can, canAccessCustomer, canActOnTask } from "../domain/permissions";
-import { draftApprovalRisks, isMaterialDraftChange, proofCompleteness, proofIsUsable, validateCustomerEvaluation } from "../domain/policy";
-import type { AiMeta, CustomerEvaluation } from "../domain/schemas";
-import type { ApiProblem, Approval, DomainState, Draft, NbaDecision, Proof, ProofCore, Role, Task } from "../domain/types";
+import { actorForRole, can, canAccessCustomer, canActOnTask, canViewRawConversation } from "../domain/permissions";
+import { draftApprovalRisks, insightTrendScope, isMaterialDraftChange, proofCompleteness, proofIsUsable, validateCustomerEvaluation, validateInsightLineage } from "../domain/policy";
+import type { AiMeta, CustomerEvaluation, WeeklyRetrospective } from "../domain/schemas";
+import type { AnalysisBatch, ApiProblem, Approval, ContentBrief, ContentOutcome, ConversationInsight, DomainState, Draft, NbaDecision, Proof, ProofCore, PublicationRecord, Role, Task } from "../domain/types";
 
 const STORAGE_KEY = "trust-to-action-dogfood-v2";
-const FIXTURE_VERSION = 3;
+const FIXTURE_VERSION = 4;
 
 type NewProof = Omit<ProofCore, "completeness" | "missing_fields" | "referenced_by">;
 
@@ -21,6 +21,14 @@ export interface DataClient {
   addCustomerNote(customerId: string, text: string, expectedRevision: number): Promise<DomainState>;
   decideApproval(id: string, decision: "approved" | "returned", reason: string, expectedRevision: number): Promise<DomainState>;
   recordTaskOutcome(id: string, outcome: string, expectedRevision: number): Promise<DomainState>;
+  saveInsightBatch(batch: AnalysisBatch, insights: ConversationInsight[]): Promise<DomainState>;
+  decideInsight(id: string, decision: "accepted" | "dismissed", reason: string, edits: Partial<Pick<ConversationInsight, "title" | "summary" | "customer_segment">>, expectedRevision: number): Promise<DomainState>;
+  saveBrief(brief: ContentBrief, expectedRevision: number): Promise<DomainState>;
+  recordRawAccess(conversationId: string, purpose: string): Promise<DomainState>;
+  markPublished(draftId: string, expectedRevision: number): Promise<DomainState>;
+  syncPublicationResults(id: string, expectedRevision: number): Promise<DomainState>;
+  recordContentOutcome(publicationId: string, type: ContentOutcome["type"], detail: string, customerId: string | null): Promise<DomainState>;
+  saveWeeklyRetrospective(retrospective: WeeklyRetrospective, meta: AiMeta | null, generatedBy: string, expectedRevision: number): Promise<DomainState>;
   saveWeeklyPlan(strategy: DomainState["weekly_plan"]["strategy"], generatedBy: string): Promise<DomainState>;
   restoreSnapshot(snapshot: DomainState): Promise<DomainState>;
   reset(): Promise<DomainState>;
@@ -246,6 +254,111 @@ class MockDataClient implements DataClient {
     return this.#persist({ ...this.#state, tasks: this.#state.tasks.map((item) => item.id === idValue ? updated : item), audits: [audit, ...this.#state.audits] });
   }
 
+  async saveInsightBatch(batch: AnalysisBatch, insights: ConversationInsight[]) {
+    await this.#latency();
+    if (!can(this.#state.role, "decide_insight")) throw problem(403, "FORBIDDEN", "只有运营可以保存会话洞察批次");
+    for (const insight of insights) {
+      const lineage = validateInsightLineage(insight, this.#state.archived_messages, this.#state.archive_consents);
+      if (!lineage.allowed) throw problem(422, lineage.code, lineage.reasons.join("；"));
+    }
+    const savedAt = now();
+    const nextBatch = { ...batch, revision: batch.revision + 1, updated_at: savedAt };
+    const audit = { id: id("audit"), actor: actorForRole(this.#state.role), action: "保存会话洞察批次", detail: `${insights.length} 条候选 · 输入 ${batch.included_count} 条有效消息`, at: savedAt, source: "ai" as const };
+    return this.#persist({ ...this.#state, analysis_batches: [nextBatch, ...this.#state.analysis_batches.filter((item) => item.id !== batch.id)], conversation_insights: [...insights, ...this.#state.conversation_insights.filter((current) => !insights.some((item) => item.id === current.id))], audits: [audit, ...this.#state.audits] });
+  }
+
+  async decideInsight(idValue: string, decision: "accepted" | "dismissed", reason: string, edits: Partial<Pick<ConversationInsight, "title" | "summary" | "customer_segment">>, expectedRevision: number) {
+    await this.#latency();
+    if (!can(this.#state.role, "decide_insight")) throw problem(403, "FORBIDDEN", "只有运营可以判断会话洞察");
+    const insight = this.#state.conversation_insights.find((item) => item.id === idValue);
+    if (!insight) throw problem(404, "NOT_FOUND", "洞察不存在");
+    if (insight.revision !== expectedRevision) throw problem(409, "VERSION_CONFLICT", "洞察已被更新", true, insight);
+    const edited = Object.values(edits).some((value) => typeof value === "string" && value.trim());
+    if ((decision === "dismissed" || edited) && !reason.trim()) throw problem(422, "REASON_REQUIRED", "忽略或编辑洞察时必须填写原因");
+    const lineage = validateInsightLineage(insight, this.#state.archived_messages, this.#state.archive_consents);
+    if (decision === "accepted" && !lineage.allowed) throw problem(422, lineage.code, lineage.reasons.join("；"));
+    const decidedAt = now();
+    const updated: ConversationInsight = {
+      ...insight, ...edits, status: decision, decision_reason: reason.trim(), decided_by: actorForRole(this.#state.role), decided_at: decidedAt,
+      trend_scope: insightTrendScope(insight.conversation_refs), revision: expectedRevision + 1, updated_at: decidedAt,
+    };
+    const audit = { id: id("audit"), actor: actorForRole(this.#state.role), action: decision === "accepted" ? "接受会话洞察" : "忽略会话洞察", detail: `${insight.title} · ${updated.trend_scope === "trend" ? "趋势" : "个体信号"} · ${reason.trim() || "无修改"}`, at: decidedAt, source: "human" as const };
+    return this.#persist({ ...this.#state, conversation_insights: this.#state.conversation_insights.map((item) => item.id === idValue ? updated : item), audits: [audit, ...this.#state.audits] });
+  }
+
+  async saveBrief(brief: ContentBrief, expectedRevision: number) {
+    await this.#latency();
+    if (!can(this.#state.role, "manage_brief")) throw problem(403, "FORBIDDEN", "只有运营可以维护内容 Brief");
+    const current = this.#state.content_briefs.find((item) => item.id === brief.id);
+    if (!current) throw problem(404, "NOT_FOUND", "内容 Brief 不存在");
+    if (current.revision !== expectedRevision) throw problem(409, "VERSION_CONFLICT", "内容 Brief 已更新", true, current);
+    const insights = brief.insight_ids.map((insightId) => this.#state.conversation_insights.find((item) => item.id === insightId));
+    if (!insights.length || insights.some((insight) => !insight || insight.status !== "accepted" || insight.invalidated_reason)) throw problem(422, "INSIGHT_NOT_ACCEPTED", "Brief 只能引用已接受且有效的会话洞察");
+    const savedAt = now();
+    const saved: ContentBrief = { ...brief, status: "adopted", adopted_by: actorForRole(this.#state.role), revision: expectedRevision + 1, updated_at: savedAt };
+    const linkedInsights = this.#state.conversation_insights.map((insight): ConversationInsight => brief.insight_ids.includes(insight.id) ? { ...insight, brief_id: brief.id, revision: insight.revision + 1, updated_at: savedAt } : insight);
+    const audit = { id: id("audit"), actor: actorForRole(this.#state.role), action: "采用内容 Brief", detail: `${brief.title} · ${brief.insight_ids.length} 条洞察血缘`, at: savedAt, source: "human" as const };
+    return this.#persist({ ...this.#state, content_briefs: this.#state.content_briefs.map((item) => item.id === brief.id ? saved : item), conversation_insights: linkedInsights, audits: [audit, ...this.#state.audits] });
+  }
+
+  async recordRawAccess(conversationId: string, purpose: string) {
+    await this.#latency();
+    const conversation = this.#state.archive_conversations.find((item) => item.id === conversationId);
+    if (!conversation || !canViewRawConversation(this.#state.role, conversation)) throw problem(403, "RAW_ACCESS_FORBIDDEN", "当前角色无权查看该会话原文");
+    if (!purpose.trim()) throw problem(422, "PURPOSE_REQUIRED", "查看会话原文前必须选择用途");
+    const audit = { id: id("audit"), actor: actorForRole(this.#state.role), action: "查看会话原文", detail: `${conversation.id} · 用途：${purpose.trim()}`, at: now(), source: "human" as const };
+    return this.#persist({ ...this.#state, audits: [audit, ...this.#state.audits] });
+  }
+
+  async markPublished(draftId: string, expectedRevision: number) {
+    await this.#latency();
+    if (!can(this.#state.role, "mark_publish")) throw problem(403, "FORBIDDEN", "只有运营可以标记人工发布");
+    const draft = this.#state.drafts.find((item) => item.id === draftId);
+    if (!draft) throw problem(404, "NOT_FOUND", "草稿不存在");
+    if (draft.revision !== expectedRevision) throw problem(409, "VERSION_CONFLICT", "草稿已被更新", true, draft);
+    if (draft.published_at) throw problem(409, "ALREADY_PUBLISHED", "该草稿已标记发布", false, draft);
+    const blockedProof = draft.evidence_refs.map((proofId) => this.#state.proofs.find((proof) => proof.id === proofId)).find((proof) => !proof || !proofIsUsable(proof) || !proof.authorization.includes(draft.channel));
+    if (blockedProof || (draft.approval_required && draft.approval_status !== "approved")) throw problem(422, "PUBLICATION_BLOCKED", "证据授权或敏感审批门禁尚未满足");
+    const publishedAt = now();
+    const publication: PublicationRecord = { id: id("publication"), revision: 1, updated_at: publishedAt, draft_id: draft.id, content_family_id: draft.content_family_id ?? "unlinked", channel: draft.channel, operator: actorForRole(this.#state.role), published_at: publishedAt, status: "published", association_window_days: 7, visible_customers: null, likes: null, comments: null, synced_at: null };
+    const updated: Draft = { ...draft, published_at: publishedAt, status: "done", revision: expectedRevision + 1, updated_at: publishedAt };
+    const audit = { id: id("audit"), actor: actorForRole(this.#state.role), action: "标记人工发布", detail: `${draft.title} · ${draft.channel} · 未调用发送接口`, at: publishedAt, source: "human" as const };
+    return this.#persist({ ...this.#state, drafts: this.#state.drafts.map((item) => item.id === draft.id ? updated : item), publications: [publication, ...this.#state.publications], audits: [audit, ...this.#state.audits] });
+  }
+
+  async syncPublicationResults(idValue: string, expectedRevision: number) {
+    await this.#latency();
+    if (!can(this.#state.role, "mark_publish")) throw problem(403, "FORBIDDEN", "只有运营可以同步合成朋友圈结果");
+    const publication = this.#state.publications.find((item) => item.id === idValue);
+    if (!publication) throw problem(404, "NOT_FOUND", "发布记录不存在");
+    if (publication.revision !== expectedRevision) throw problem(409, "VERSION_CONFLICT", "发布结果已更新", true, publication);
+    const seed = this.#state.publications.findIndex((item) => item.id === idValue) + 1;
+    const syncedAt = now();
+    const updated: PublicationRecord = { ...publication, status: "results_synced", visible_customers: 70 + seed * 13, likes: 3 + seed * 2, comments: seed % 5, synced_at: syncedAt, revision: expectedRevision + 1, updated_at: syncedAt };
+    const audit = { id: id("audit"), actor: "合成朋友圈同步器", action: "同步平台互动结果", detail: `${publication.id} · 可见 ${updated.visible_customers} · 点赞 ${updated.likes} · 评论 ${updated.comments}`, at: syncedAt, source: "system" as const };
+    return this.#persist({ ...this.#state, publications: this.#state.publications.map((item) => item.id === idValue ? updated : item), audits: [audit, ...this.#state.audits] });
+  }
+
+  async recordContentOutcome(publicationId: string, type: ContentOutcome["type"], detail: string, customerId: string | null) {
+    await this.#latency();
+    if (!can(this.#state.role, "record_content_outcome")) throw problem(403, "FORBIDDEN", "只有销售可以回填内容业务结果");
+    if (!this.#state.publications.some((item) => item.id === publicationId)) throw problem(404, "NOT_FOUND", "发布记录不存在");
+    if (!detail.trim()) throw problem(422, "OUTCOME_REQUIRED", "请填写业务结果");
+    const recordedAt = now();
+    const outcome: ContentOutcome = { id: id("outcome"), revision: 1, updated_at: recordedAt, publication_id: publicationId, customer_id: customerId, type, detail: detail.trim(), occurred_at: recordedAt, recorded_by: actorForRole(this.#state.role) };
+    const audit = { id: id("audit"), actor: actorForRole(this.#state.role), action: "回填内容业务结果", detail: `${publicationId} · ${type} · ${detail.trim()}`, at: recordedAt, source: "human" as const };
+    return this.#persist({ ...this.#state, content_outcomes: [outcome, ...this.#state.content_outcomes], audits: [audit, ...this.#state.audits] });
+  }
+
+  async saveWeeklyRetrospective(retrospective: WeeklyRetrospective, meta: AiMeta | null, generatedBy: string, expectedRevision: number) {
+    await this.#latency();
+    if (!can(this.#state.role, "generate_strategy")) throw problem(403, "FORBIDDEN", "只有运营可以保存周复盘");
+    const current = this.#state.weekly_retrospective;
+    if (current.revision !== expectedRevision) throw problem(409, "VERSION_CONFLICT", "周复盘已更新", true, current);
+    const savedAt = now();
+    return this.#persist({ ...this.#state, weekly_retrospective: { ...current, retrospective, generated_by: generatedBy, ai_meta: meta, revision: expectedRevision + 1, updated_at: savedAt }, audits: [{ id: id("audit"), actor: generatedBy, action: "保存周复盘", detail: `${retrospective.week_label} · ${retrospective.next_week_candidates.length} 个下周策略候选`, at: savedAt, source: meta ? "ai" as const : "human" as const }, ...this.#state.audits] });
+  }
+
   async saveWeeklyPlan(strategy: DomainState["weekly_plan"]["strategy"], generatedBy: string) {
     await this.#latency();
     if (!can(this.#state.role, "generate_strategy")) throw problem(403, "FORBIDDEN", "只有运营角色可以生成周策略");
@@ -274,6 +387,14 @@ class HttpDataClient implements DataClient {
   addCustomerNote(customerId: string, text: string, expectedRevision: number) { return this.#request(`/customers/${customerId}/notes`, { method: "POST", body: JSON.stringify({ text, expected_revision: expectedRevision }) }); }
   decideApproval(idValue: string, decision: "approved" | "returned", reason: string, expectedRevision: number) { return this.#request(`/approvals/${idValue}`, { method: "PUT", body: JSON.stringify({ decision, reason, expected_revision: expectedRevision }) }); }
   recordTaskOutcome(idValue: string, outcome: string, expectedRevision: number) { return this.#request(`/tasks/${idValue}/outcome`, { method: "POST", body: JSON.stringify({ outcome, expected_revision: expectedRevision }) }); }
+  saveInsightBatch(batch: AnalysisBatch, insights: ConversationInsight[]) { return this.#request("/insight-batches", { method: "POST", body: JSON.stringify({ batch, insights }) }); }
+  decideInsight(idValue: string, decision: "accepted" | "dismissed", reason: string, edits: Partial<Pick<ConversationInsight, "title" | "summary" | "customer_segment">>, expectedRevision: number) { return this.#request(`/insights/${idValue}/decision`, { method: "POST", body: JSON.stringify({ decision, reason, edits, expected_revision: expectedRevision }) }); }
+  saveBrief(brief: ContentBrief, expectedRevision: number) { return this.#request(`/briefs/${brief.id}`, { method: "PUT", body: JSON.stringify({ brief, expected_revision: expectedRevision }) }); }
+  recordRawAccess(conversationId: string, purpose: string) { return this.#request(`/archive/conversations/${conversationId}/access`, { method: "POST", body: JSON.stringify({ purpose }) }); }
+  markPublished(draftId: string, expectedRevision: number) { return this.#request(`/drafts/${draftId}/publication`, { method: "POST", body: JSON.stringify({ expected_revision: expectedRevision }) }); }
+  syncPublicationResults(idValue: string, expectedRevision: number) { return this.#request(`/publications/${idValue}/sync`, { method: "POST", body: JSON.stringify({ expected_revision: expectedRevision }) }); }
+  recordContentOutcome(publicationId: string, type: ContentOutcome["type"], detail: string, customerId: string | null) { return this.#request(`/publications/${publicationId}/outcomes`, { method: "POST", body: JSON.stringify({ type, detail, customer_id: customerId }) }); }
+  saveWeeklyRetrospective(retrospective: WeeklyRetrospective, meta: AiMeta | null, generatedBy: string, expectedRevision: number) { return this.#request("/weekly-retrospective", { method: "PUT", body: JSON.stringify({ retrospective, meta, generated_by: generatedBy, expected_revision: expectedRevision }) }); }
   saveWeeklyPlan(strategy: DomainState["weekly_plan"]["strategy"], generatedBy: string) { return this.#request("/weekly-plan", { method: "PUT", body: JSON.stringify({ strategy, generated_by: generatedBy }) }); }
   restoreSnapshot(snapshot: DomainState) { return this.#request("/undo", { method: "POST", body: JSON.stringify({ snapshot }) }); }
   reset() { return this.#request("/reset", { method: "POST" }); }

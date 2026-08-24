@@ -1,4 +1,4 @@
-# Trust-to-Action 内部增长副驾 Dogfood 产品方案 V2
+# Trust-to-Action 内部增长副驾 Dogfood 产品方案 V2（归档）
 
 > 文档版本：V2.0 Local Review
 > 更新日期：2026-08-23
