@@ -1,10 +1,10 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { Activity, AlertTriangle, ArrowRight, Bot, Check, Clock3, FlaskConical, GitBranch, Gauge, Pause, Play, ShieldCheck, Sparkles, TrendingUp, UserCheck, X } from "lucide-react";
+import { Activity, AlertTriangle, ArrowRight, Bot, Check, Clock3, Cloud, FlaskConical, GitBranch, Gauge, Pause, Play, Server, ShieldCheck, Sparkles, TrendingUp, UserCheck, X } from "lucide-react";
 import { Link } from "react-router-dom";
 import { InlineAlert, LoadingState, Modal, SectionHeader, StatusBadge } from "../components/UI";
 import { actorForRole, can } from "../domain/permissions";
 import { calculateQualityMetrics, QUALITY_THRESHOLDS } from "../domain/quality";
-import type { EvaluationDecision, EvaluationReasonCode, EvaluationReviewOutcome } from "../domain/types";
+import type { AiProtocol, AiProviderId, EvaluationDecision, EvaluationReasonCode, EvaluationReviewOutcome } from "../domain/types";
 import { useAppStore } from "../store/AppStore";
 
 const REASON_LABELS: Record<EvaluationReasonCode, string> = {
@@ -16,18 +16,17 @@ const REASON_LABELS: Record<EvaluationReasonCode, string> = {
   too_generic: "过于泛化",
   other: "其他",
 };
+const PROVIDER_LABELS: Record<AiProviderId, string> = { openai: "OpenAI", deepseek: "DeepSeek", anthropic: "Anthropic", qwen: "Qwen", custom: "企业私有端点" };
+const PROTOCOL_LABELS: Record<AiProtocol, string> = { openai_responses: "Responses", openai_chat: "Chat JSON", anthropic_messages: "Messages" };
 
 export function AiQuality() {
-  const { state, loading, health, runGoldenEvaluation, startLiveHoldout, pauseLiveHoldout, createRouterVersion, promoteAiVersion, rollbackAiVersion, recordEvaluationReview, reload, explainError } = useAppStore();
+  const { state, loading, health, runGoldenEvaluation, startLiveHoldout, pauseLiveHoldout, promoteAiVersion, rollbackAiVersion, recordEvaluationReview, reload, explainError } = useAppStore();
   const [brainId, setBrainId] = useState("brain-v2.2-published");
   const [routerId, setRouterId] = useState("router-v2.1-rc1");
   const [split, setSplit] = useState<"development" | "holdout">("development");
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<{ code: string; message: string } | null>(null);
   const [reviewInputs, setReviewInputs] = useState<Record<string, string>>({});
-  const [versionName, setVersionName] = useState("router-v2.2-risk-next");
-  const [versionDescription, setVersionDescription] = useState("保持质量优先，只调整低风险任务的 Terra 升级阈值");
-  const [confidenceThreshold, setConfidenceThreshold] = useState(75);
   const [usageDialogOpen, setUsageDialogOpen] = useState(false);
   const [usageConfirmed, setUsageConfirmed] = useState(false);
   const liveRunning = state?.eval_runs.some((item) => item.mode === "live" && item.status === "running") ?? false;
@@ -47,6 +46,7 @@ export function AiQuality() {
   const reasonCounts = Object.entries(REASON_LABELS).map(([code, label]) => ({ code, label, count: state.evaluation_decisions.filter((item) => item.reason_code === code).length })).sort((left, right) => right.count - left.count);
   const canManage = can(state.role, "manage_ai_quality");
   const canPublish = can(state.role, "publish_ai_version");
+  const activeProfile = state.model_profiles.find((item) => item.status === "active");
 
   async function runEval() {
     setBusy("eval"); setError(null);
@@ -84,16 +84,6 @@ export function AiQuality() {
     catch (cause) { setError(explainError(cause)); } finally { setBusy(null); }
   }
 
-  async function createVersion() {
-    if (!versionName.trim() || !versionDescription.trim()) return;
-    setBusy("create-version"); setError(null);
-    try {
-      await createRouterVersion(versionName, versionDescription, confidenceThreshold);
-      setVersionName("router-v2.2-risk-next");
-      setVersionDescription("");
-    } catch (cause) { setError(explainError(cause)); } finally { setBusy(null); }
-  }
-
   async function review(decisionId: string, outcome: EvaluationReviewOutcome, revision: number) {
     const reason = reviewInputs[decisionId] ?? "";
     if (outcome !== "retained" && !reason.trim()) return;
@@ -118,29 +108,26 @@ export function AiQuality() {
       <QualityMetric icon={<Bot />} label="检索命中" value={`${metrics.retrieval_hit_rate}%`} target="四类任务有知识依据" pass={metrics.retrieval_hit_rate >= 95} />
       <QualityMetric icon={<ShieldCheck />} label="知识引用精度" value={`${metrics.knowledge_citation_precision}%`} target="必须 100%" pass={metrics.knowledge_citation_precision === 100} />
       <QualityMetric icon={<Clock3 />} label="P95 生成" value={`${(metrics.p95_latency_ms / 1000).toFixed(1)}s`} target="目标 ≤ 30s" pass={metrics.p95_latency_ms <= QUALITY_THRESHOLDS.p95LatencyMs} />
-      <QualityMetric icon={<GitBranch />} label="模型升级率" value={`${metrics.escalation_rate}%`} target={`Terra 占比 ${metrics.fast_model_share}%`} pass />
+      <QualityMetric icon={<GitBranch />} label="备用回退率" value={`${metrics.escalation_rate}%`} target="仅同供应商回退一次" pass />
     </div>
 
     <section className="panel quality-slices"><div className="panel-heading"><div><span className="eyebrow">四类质量切片</span><h2>决策采用与知识适用</h2></div><Gauge /></div><div className="quality-slice-grid">{Object.entries(metrics.task_slices).map(([task, slice]) => <article key={task}><span>{({ weekly_strategy: "本周策略", content_brief: "内容 Brief", content_draft: "内容草稿", customer_nba: "客户 NBA" } as Record<string, string>)[task]}</span><strong className={slice.adoption_rate >= QUALITY_THRESHOLDS.minimumTaskAdoption ? "success-text" : "warning-text"}>{slice.adoption_rate}%</strong><dl><div><dt>审阅覆盖</dt><dd>{slice.review_coverage_rate}%</dd></div><div><dt>引用精度</dt><dd>{slice.knowledge_citation_precision}%</dd></div><div><dt>来源适用</dt><dd>{slice.source_applicability_rate}%</dd></div><div><dt>P95</dt><dd>{(slice.p95_latency_ms / 1000).toFixed(1)}s</dd></div></dl><small>单类门槛 ≥ {QUALITY_THRESHOLDS.minimumTaskAdoption}% · {slice.pending} 条待审</small></article>)}</div></section>
+
+    {state.role !== "sales" && <section className="panel provider-quality-panel"><div className="panel-heading"><div><span className="eyebrow">模型兼容性与数据去向</span><h2>供应商、协议与 Profile 质量</h2></div><Cloud /></div><div className="provider-quality-grid">{Object.values(metrics.profile_slices).map((slice) => <article key={slice.profile_id}><div className="provider-quality-head"><span className="provider-mark">{slice.endpoint_scope === "private" ? <Server /> : <Cloud />}</span><span><strong>{PROVIDER_LABELS[slice.provider]}</strong><small>{slice.profile_name}</small></span><b>{slice.success_rate}%</b></div><dl><div><dt>模型</dt><dd>{slice.model}</dd></div><div><dt>协议</dt><dd>{PROTOCOL_LABELS[slice.protocol]}</dd></div><div><dt>回退</dt><dd>{slice.fallback_rate}%</dd></div><div><dt>P95</dt><dd>{(slice.p95_latency_ms / 1000).toFixed(1)}s</dd></div><div><dt>Token</dt><dd>{slice.input_tokens + slice.output_tokens}</dd></div><div><dt>数据边界</dt><dd>{slice.endpoint_scope === "private" ? "企业私有" : "公有云"}</dd></div></dl></article>)}</div></section>}
 
     {(metrics.policy_violations > 0 || metrics.privacy_leaks > 0) && <InlineAlert tone="danger" title="安全门禁未通过">策略违规 {metrics.policy_violations}，隐私泄露 {metrics.privacy_leaks}。任何非零结果都会阻断发布。</InlineAlert>}
 
     {state.role === "sales" ? <SalesFeedback decisions={myDecisions} inputs={reviewInputs} busy={busy} onInput={(id, value) => setReviewInputs((items) => ({ ...items, [id]: value }))} onReview={review} /> : <>
       <div className="quality-workspace">
         <section className="panel quality-feedback"><div className="panel-heading"><div><span className="eyebrow">行为反馈</span><h2>修改与拒绝原因</h2></div><Activity /></div>{reasonCounts.map((item) => <div className="reason-bar" key={item.code}><span>{item.label}</span><i><b style={{ width: `${Math.min(100, item.count * 14)}%` }} /></i><strong>{item.count}</strong></div>)}</section>
-        <section className="panel route-health"><div className="panel-heading"><div><span className="eyebrow">动态路由</span><h2>质量优先，两档模型</h2></div><GitBranch /></div><dl className="route-stats"><div><dt>主模型</dt><dd>gpt-5.6</dd></div><div><dt>轻量模型</dt><dd>gpt-5.6-terra</dd></div><div><dt>Terra 分流</dt><dd>{metrics.fast_model_share}%</dd></div><div><dt>升级至主模型</dt><dd>{metrics.escalation_rate}%</dd></div></dl><InlineAlert tone="info" title="只升不降">Terra 低置信、拒答、结构或策略失败时最多升级一次；主模型失败后阻断。</InlineAlert></section>
+        <section className="panel route-health"><div className="panel-heading"><div><span className="eyebrow">全局模型 Profile</span><h2>{activeProfile ? `${PROVIDER_LABELS[activeProfile.provider]} · ${activeProfile.primary_model}` : "尚未激活"}</h2></div><GitBranch /></div><dl className="route-stats"><div><dt>协议</dt><dd>{activeProfile ? PROTOCOL_LABELS[activeProfile.protocol] : "—"}</dd></div><div><dt>备用模型</dt><dd>{activeProfile?.fallback_model ?? "未配置"}</dd></div><div><dt>Fallback</dt><dd>{metrics.escalation_rate}%</dd></div><div><dt>数据边界</dt><dd>{activeProfile?.endpoint_scope === "private" ? "企业私有" : "公有云"}</dd></div></dl><InlineAlert tone="info" title="不跨供应商传输">七类任务均从全局主模型开始；只有可回退错误会切换一次同供应商备用模型，随后失败即阻断。</InlineAlert></section>
       </div>
 
-      {canManage && <section className="panel version-authoring desktop-authoring">
-        <div className="panel-heading"><div><span className="eyebrow">仅桌面维护</span><h2>创建模型路由候选</h2></div><GitBranch /></div>
-        <InlineAlert tone="info" title="Prompt 不在页面内编辑">四类 Prompt 由代码 builder 生成并以哈希进入 MarketingBrainVersion。代码、知识包或事实绑定变化后自动形成营销脑候选，不允许创建仅含名称和描述的空壳 Prompt。</InlineAlert>
-        <div className="version-authoring-fields"><label><span>版本名称</span><input aria-label="路由版本名称" value={versionName} onChange={(event) => setVersionName(event.target.value)} /></label><label className="version-description"><span>变更说明与策略摘要</span><textarea rows={2} value={versionDescription} onChange={(event) => setVersionDescription(event.target.value)} /></label><label><span>Terra 升级阈值</span><input type="number" min={50} max={95} value={confidenceThreshold} onChange={(event) => setConfidenceThreshold(Number(event.target.value))} /></label><button className="primary-button" disabled={busy === "create-version" || !versionName.trim() || !versionDescription.trim()} onClick={() => void createVersion()}><Sparkles />创建路由候选</button></div>
-      </section>}
-      {canManage && <div className="mobile-authoring-notice"><InlineAlert tone="info" title="请使用桌面端">营销脑哈希对比、黄金集管理和模型路由编辑在桌面端开放；移动端仍可查看质量指标。</InlineAlert></div>}
+      {canManage && <div className="mobile-authoring-notice"><InlineAlert tone="info" title="请使用桌面端">营销脑哈希对比、黄金集和模型 Profile 治理在桌面端开放；移动端仍可查看质量指标。</InlineAlert></div>}
 
       <section className="panel eval-console">
         <div className="panel-heading"><div><span className="eyebrow">440 条纯合成黄金集</span><h2>逐条回放、检索与确定性 grader</h2></div><FlaskConical /></div>
-        <div className="eval-controls"><label><span>营销脑版本</span><select value={brainId} onChange={(event) => setBrainId(event.target.value)}>{state.marketing_brain_versions.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.status}</option>)}</select></label><label><span>模型路由</span><select value={routerId} onChange={(event) => setRouterId(event.target.value)}>{state.router_versions.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.status}</option>)}</select></label><label><span>数据切分</span><select value={split} onChange={(event) => setSplit(event.target.value as typeof split)}><option value="development">调优集 · 352</option><option value="holdout">锁定 Holdout · 88</option></select></label><button className="primary-button" disabled={!canManage || busy === "eval"} onClick={() => void runEval()}><Sparkles />{busy === "eval" ? "正在评分…" : "运行离线评测"}</button></div>
+        <div className="eval-controls"><label><span>营销脑版本</span><select value={brainId} onChange={(event) => setBrainId(event.target.value)}>{state.marketing_brain_versions.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.status}</option>)}</select></label><label><span>兼容评测基线</span><select value={routerId} onChange={(event) => setRouterId(event.target.value)}>{state.router_versions.map((item) => <option key={item.id} value={item.id}>{item.name} · 仅迁移兼容</option>)}</select></label><label><span>数据切分</span><select value={split} onChange={(event) => setSplit(event.target.value as typeof split)}><option value="development">调优集 · 352</option><option value="holdout">锁定 Holdout · 88</option></select></label><button className="primary-button" disabled={!canManage || busy === "eval"} onClick={() => void runEval()}><Sparkles />{busy === "eval" ? "正在评分…" : "运行离线评测"}</button></div>
         {!canManage && <small className="muted">负责人可查看和发布；运行评测由运营执行。</small>}
         {latestEval?.score && <div className={`eval-result ${latestEval.score.passed ? "eval-pass" : "eval-blocked"}`}><span>{latestEval.split === "holdout" ? "锁定 Holdout" : "调优集"} · {latestEval.case_count} 条</span><strong>{latestEval.score.passed ? <><Check />全部门槛通过</> : <><X />发布被阻断</>}</strong><small>宏平均 {latestEval.score.macro_adoption_rate}%（+{latestEval.score.adoption_improvement_points.toFixed(1)}pp） · Recall@5 {latestEval.score.knowledge_recall_at_5}% · 知识引用 {latestEval.score.knowledge_citation_precision}% · 业务证据 {latestEval.score.business_evidence_precision}% · P95 {(latestEval.score.p95_latency_ms / 1000).toFixed(1)}s</small></div>}
         <div className="live-eval-console">
@@ -155,17 +142,16 @@ export function AiQuality() {
             <progress max={latestLiveEval.case_count} value={latestLiveEval.processed_count ?? 0} />
             <small>成功 {latestLiveEval.successful_count ?? 0} · 失败 {latestLiveEval.failed_count ?? 0} · 输入 {latestLiveEval.input_tokens ?? 0} tokens · 输出 {latestLiveEval.output_tokens ?? 0} tokens</small>
           </div>}
-          {!health?.ai_configured && <InlineAlert tone="warning" title="OpenAI 尚未配置">先在本地 AI 配置中验证主模型与 Terra 权限，真实 Holdout 不提供 Mock 降级。</InlineAlert>}
+          {!health?.ai_configured && <InlineAlert tone="warning" title="全局模型尚未就绪">先在模型治理页验证并激活一个 Profile；真实 Holdout 不提供 Mock 或跨供应商降级。</InlineAlert>}
         </div>
       </section>
 
-      <section className="version-band">
+      <section className="version-band single-column">
         <BrainVersionTable rows={state.marketing_brain_versions} canPublish={canPublish} busy={busy} onPromote={promote} onRollback={rollback} />
-        <VersionTable title="路由版本" rows={state.router_versions} kind="router" canPublish={canPublish} busy={busy} onPromote={promote} onRollback={rollback} />
       </section>
     </>}
     <Modal open={usageDialogOpen} title="确认真实 Holdout API 用量" onClose={() => { if (busy !== "live-eval") setUsageDialogOpen(false); }} actions={<><button className="secondary-button" disabled={busy === "live-eval"} onClick={() => setUsageDialogOpen(false)}>取消</button><button className="primary-button" disabled={!usageConfirmed || busy === "live-eval"} onClick={() => void runLiveEval()}><Play />{busy === "live-eval" ? "正在启动…" : "确认并运行 88 条"}</button></>}>
-      <div className="usage-confirmation"><InlineAlert tone="warning" title="本次会产生真实 API 用量">系统会调用所选营销脑和模型路由处理 88 条纯合成锁定案例，最大并发 2。失败案例不会自动无限重试，续跑沿用逐案例幂等键。</InlineAlert><dl><div><dt>营销脑</dt><dd>{state.marketing_brain_versions.find((item) => item.id === brainId)?.name ?? brainId}</dd></div><div><dt>模型路由</dt><dd>{state.router_versions.find((item) => item.id === routerId)?.name ?? routerId}</dd></div><div><dt>数据</dt><dd>88 条纯合成 Holdout</dd></div></dl><label className="confirmation-check"><input type="checkbox" checked={usageConfirmed} onChange={(event) => setUsageConfirmed(event.target.checked)} /><span>我确认本次真实模型调用及其 API 用量，并理解结果仅用于发布评测。</span></label></div>
+      <div className="usage-confirmation"><InlineAlert tone="warning" title="本次会产生真实 API 用量">系统会调用当前全局 Profile 处理 88 条纯合成锁定案例，最大并发 2。失败案例不会自动无限重试，续跑沿用逐案例幂等键。</InlineAlert><dl><div><dt>营销脑</dt><dd>{state.marketing_brain_versions.find((item) => item.id === brainId)?.name ?? brainId}</dd></div><div><dt>模型 Profile</dt><dd>{activeProfile ? `${PROVIDER_LABELS[activeProfile.provider]} · ${activeProfile.primary_model}` : "未激活"}</dd></div><div><dt>数据</dt><dd>88 条纯合成 Holdout</dd></div></dl><label className="confirmation-check"><input type="checkbox" checked={usageConfirmed} onChange={(event) => setUsageConfirmed(event.target.checked)} /><span>我确认本次真实模型调用及其 API 用量，并理解结果仅用于发布评测。</span></label></div>
     </Modal>
   </>;
 }
@@ -181,8 +167,4 @@ function SalesFeedback({ decisions, inputs, busy, onInput, onReview }: { decisio
 
 function BrainVersionTable({ rows, canPublish, busy, onPromote, onRollback }: { rows: import("../domain/types").MarketingBrainVersion[]; canPublish: boolean; busy: string | null; onPromote(kind: "brain" | "router", id: string, revision: number): void; onRollback(kind: "brain" | "router", id: string, revision: number): void }) {
   return <section className="panel version-panel brain-version-panel"><div className="panel-heading"><div><span className="eyebrow">原子版本治理</span><h2>营销脑版本</h2></div><GitBranch /></div>{rows.map((item) => <div className="version-row" key={item.id}><StatusBadge status={item.status === "published" ? "approved" : item.status === "draft" ? "review" : "done"} /><span><strong>{item.name}</strong><small>周策略 {item.prompt_hashes.weekly_strategy} · Brief {item.prompt_hashes.content_brief} · 草稿 {item.prompt_hashes.content_draft} · NBA {item.prompt_hashes.customer_nba}</small><small>{item.knowledge_pack_version_id} · {item.tenant_fact_version_id} · {item.retriever_version}</small></span>{item.status === "draft" && <button className="secondary-button" disabled={!canPublish || busy === `brain:${item.id}`} onClick={() => onPromote("brain", item.id, item.revision)}>发布</button>}{item.status === "archived" && item.published_at && <button className="secondary-button" disabled={!canPublish || busy === `rollback:brain:${item.id}`} onClick={() => onRollback("brain", item.id, item.revision)}>回滚</button>}</div>)}</section>;
-}
-
-function VersionTable({ title, rows, kind, canPublish, busy, onPromote, onRollback }: { title: string; rows: Array<{ id: string; revision: number; name: string; status: "draft" | "published" | "archived"; description: string; updated_at: string; published_at?: string | null }>; kind: "router"; canPublish: boolean; busy: string | null; onPromote(kind: "brain" | "router", id: string, revision: number): void; onRollback(kind: "brain" | "router", id: string, revision: number): void }) {
-  return <section className="panel version-panel"><div className="panel-heading"><div><span className="eyebrow">版本治理</span><h2>{title}</h2></div><GitBranch /></div>{rows.map((item) => <div className="version-row" key={item.id}><StatusBadge status={item.status === "published" ? "approved" : item.status === "draft" ? "review" : "done"} /><span><strong>{item.name}</strong><small>{item.description}</small></span>{item.status === "draft" && <button className="secondary-button" disabled={!canPublish || busy === `${kind}:${item.id}`} onClick={() => onPromote(kind, item.id, item.revision)}>发布</button>}{item.status === "archived" && item.published_at && <button className="secondary-button" disabled={!canPublish || busy === `rollback:${kind}:${item.id}`} onClick={() => onRollback(kind, item.id, item.revision)}>回滚</button>}</div>)}</section>;
 }

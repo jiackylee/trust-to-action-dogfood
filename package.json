@@ -1,6 +1,6 @@
 {
   "name": "trust-to-action-dogfood-v2",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -15,9 +15,10 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "playwright test",
-    "test:live": "RUN_LIVE_OPENAI_TEST=1 vitest run server/live-openai.test.ts"
+    "test:live": "vitest run server/live-providers.test.ts"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.120.0",
     "better-sqlite3": "^13.0.3",
     "express": "5.2.1",
     "lucide-react": "0.468.0",

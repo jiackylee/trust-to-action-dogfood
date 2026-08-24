@@ -36,7 +36,7 @@ export function Shell() {
   }, [roleOpen]);
   return <div className="app-shell">
     <aside className="sidebar" aria-label="主导航">
-      <div className="brand" title="Trust-to-Action 2.2"><span className="brand-mark"><Sparkles /></span><span className="brand-copy"><strong>Trust-to-Action</strong><small>营销大脑 · 2.2</small></span></div>
+      <div className="brand" title="Trust-to-Action 2.3"><span className="brand-mark"><Sparkles /></span><span className="brand-copy"><strong>Trust-to-Action</strong><small>多模型营销大脑 · 2.3</small></span></div>
       <nav className="nav-groups">{nav.map((section) => <div className="nav-group" key={section.group}><div className="nav-group-label">{section.group}</div>{section.items.map((item, index) => <NavLink key={item.to} to={item.to} end={item.to === "/"} className={({ isActive }) => `nav-link${isActive ? " active" : ""}${index === 0 && isSectionActive(section.group, location.pathname) ? " mobile-parent-active" : ""}`} title={item.label} aria-label={item.label}><item.icon /><span>{item.label}</span></NavLink>)}</div>)}</nav>
       <div className="sidebar-footer">
         <div className={`health-pill ${health?.ai_configured && health?.knowledge_configured ? "healthy" : "warning"}`} title={health?.ai_configured && health?.knowledge_configured ? `AI 与知识已连接 · ${health.model}` : "AI 或知识未配置，生成操作会明确阻断"}><Activity /><span>{health?.ai_configured && health?.knowledge_configured ? "营销脑已连接" : "营销脑未就绪"}</span></div>
@@ -57,7 +57,7 @@ export function Shell() {
     </div>
     <ToastRegion />
     <Modal open={resetOpen} title="重置全部演示数据？" onClose={() => setResetOpen(false)} actions={<><button className="secondary-button" onClick={() => setResetOpen(false)}>取消</button><button className="danger-button" onClick={() => { void resetDemo(); setResetOpen(false); }}>确认重置</button></>}>
-      <p>这会清除 2.2 SQLite 中的合成修改、AI 候选、审批和任务结果，并恢复 24 位合成客户与 440 条黄金集。私有知识文件不会被改动。</p>
+      <p>这会清除 2.3 SQLite 中的合成修改、AI 候选、审批和任务结果，并恢复 24 位合成客户与 440 条黄金集。私有知识文件不会被改动。</p>
     </Modal>
   </div>;
 }

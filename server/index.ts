@@ -4,6 +4,7 @@ import { createOpenAiServiceManager } from "./ai-service";
 import { defaultDatabasePath, SqliteStateRepository } from "./repository";
 import { SessionManager } from "./session";
 import { KnowledgeService } from "./knowledge-service";
+import { restorePersistedModelProfile } from "./model-profile-runtime";
 
 if (fs.existsSync(".env")) process.loadEnvFile(".env");
 
@@ -22,10 +23,11 @@ if (initial.repositoryRevision === 1 && knowledgeService.status("tenant-dogfood-
   const hydrated = bindDemoStateToActiveKnowledge(initial.state, "tenant-dogfood-cn", knowledgeService);
   repository.save("tenant-dogfood-cn", hydrated, initial.repositoryRevision);
 }
+const profileRestoreStatus = restorePersistedModelProfile(repository, aiService, "tenant-dogfood-cn");
 const sessionManager = new SessionManager(process.env.SESSION_SECRET);
 const app = createApp({ aiService, repository, knowledgeService, sessionManager, serveDist: process.env.SERVE_DIST === "true" });
 const server = app.listen(port, "127.0.0.1", () => {
-  console.log(`Trust-to-Action 2.2 listening on http://127.0.0.1:${port} (AI ${aiService.configured ? "configured" : "blocked"}, knowledge ${knowledgeService.configured ? "configured" : "blocked"}, primary ${aiService.model}, fast ${aiService.fastModel})`);
+  console.log(`Trust-to-Action 2.3 listening on http://127.0.0.1:${port} (AI ${aiService.configured ? "configured" : "blocked"}, knowledge ${knowledgeService.configured ? "configured" : "blocked"}, provider ${aiService.getConfiguration().provider}, primary ${aiService.model}, fallback ${aiService.fastModel ?? "none"}, restore ${profileRestoreStatus})`);
 });
 
 function shutdown() {

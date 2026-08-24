@@ -1,8 +1,8 @@
-# Trust-to-Action Dogfood V2.2
+# Trust-to-Action Dogfood V2.3
 
-面向运营、销售和负责人的企微营销大脑 Dogfood。2.2 将项目 SKILLS、精选理论和企业事实接入周策略、内容 Brief、朋友圈草稿与客户 NBA，以四类输出的“决策有效采用率”作为 North Star。
+面向运营、销售和负责人的企微营销大脑 Dogfood。2.3 在知识增强闭环上增加 OpenAI、DeepSeek、Anthropic、Qwen 与企业私有模型端点，使用一个全局 Model Profile 治理全部七类 AI 任务。
 
-当前产品、知识架构、AI 契约、评测门禁和验收标准见 [2.2 营销大脑知识增强产品方案](docs/Trust-to-Action_2.2_营销大脑知识增强产品方案.md)。2.1 及更早方案已移入 `docs/archive/`，仅作历史参考。
+产品、接口、安全边界和验收标准见 [2.3 多模型治理产品方案](docs/Trust-to-Action_2.3_多模型治理产品方案.md)。2.2 及更早方案位于 `docs/archive/`，仅作历史参考。
 
 ## 本地运行
 
@@ -14,28 +14,45 @@ npm run dev
 
 访问 `http://127.0.0.1:4174/`。BFF 运行在 `127.0.0.1:4175`，Vite 将 `/api` 代理至 BFF。
 
-默认 `VITE_DATA_MODE=http`。BFF 使用 `better-sqlite3`、WAL、FTS5 `trigram` 和迁移文件将合成租户状态与知识索引写入 `./data/trust-to-action-v2.2.sqlite`。首次启动自动装载 fixture V7；“重置演示数据”由服务端执行。
+默认 `VITE_DATA_MODE=http`。BFF 使用 `better-sqlite3`、WAL、FTS5 `trigram` 和迁移文件，将合成租户状态与知识索引写入 `./data/trust-to-action-v2.3.sqlite`。首次启动装载 fixture V8；“重置演示数据”由服务端执行。
 
-2.2 的四类生成必须挂载私有知识包：
+## 多模型配置
+
+治理页支持以下连接：
+
+| 供应商 | 默认环境变量 | 默认协议 |
+| --- | --- | --- |
+| OpenAI | `OPENAI_API_KEY` | Responses |
+| DeepSeek | `DEEPSEEK_API_KEY` | Responses |
+| Anthropic | `ANTHROPIC_API_KEY` | Messages |
+| Qwen / DashScope | `DASHSCOPE_API_KEY` | Responses 或 Chat JSON |
+| 企业私有端点 | 自定义引用或无需认证 | Responses 或 Chat JSON |
+
+密钥只来自 BFF 环境变量或进程内存，禁止添加 `VITE_` 前缀。页面录入的会话密钥重启即清除；如果当前 Profile 没有对应环境凭据，重启后会标记为 `credential_missing`，不会跨供应商回退或静默切回 OpenAI。
+
+企业全局激活一个 Model Profile。七类任务先调用主模型，仅对限流、超时、可重试服务失败、拒答、截断、结构失败、低置信或模型策略失败回退一次。备用模型始终使用同一供应商、连接和协议。鉴权、权限、同意、硬合规和预算阻断不触发回退。
+
+企业私有端点要求：
+
+- 非 loopback 域名写入服务端 `AI_ENDPOINT_ALLOWLIST`。
+- 生产和局域网端点使用 HTTPS；仅开发环境允许 loopback HTTP。
+- URL 不得包含凭据、查询参数或片段，重定向和云元数据地址会被阻断。
+- 私有 CA 在启动进程前通过 `NODE_EXTRA_CA_CERTS=/absolute/path/to/ca.pem npm run dev` 配置。
+- 本项目只调用企业已有端点，不下载、托管或启动模型权重。
+
+未配置可用模型时，页面、已有候选审阅、质量中心和合成数据仍可评审；真实生成返回 `AI_NOT_CONFIGURED`，不使用 Mock AI。
+
+## 私有知识包
+
+四类营销决策必须挂载 2.2 建立的私有知识包：
 
 ```bash
 KNOWLEDGE_PACK_PATH=/absolute/path/to/private-knowledge-pack
 ```
 
-目录需包含四套选定 SKILL 及五份最终 Markdown 资料。BFF 只读扫描允许来源，排除书籍、旧迭代与重复资料，并在首次启动建立索引和激活初始版本。未配置、未索引或未激活时返回 `KNOWLEDGE_NOT_CONFIGURED`，不会静默退化为通用 Prompt。私有知识正文、原始书籍和本机绝对路径不得提交到 Git。
+目录需包含选定 SKILL 和最终 Markdown 资料。BFF 只读扫描允许来源并建立本地索引。未配置、未索引或未激活时返回 `KNOWLEDGE_NOT_CONFIGURED`，不会退化为通用 Prompt。私有知识正文、原始书籍和本机绝对路径不得提交到 Git。
 
-不配置 `OPENAI_API_KEY` 时，页面、已有候选审阅、质量中心和合成数据仍可评审，但真实 AI 生成会返回 `AI_NOT_CONFIGURED`，不会使用 Mock AI。
-
-本地 Dogfood 提供两种配置方式：
-
-- 持久配置：在本目录 `.env` 中设置 `OPENAI_API_KEY`，变量名不能添加 `VITE_` 前缀；修改后重启服务。
-- 临时配置：打开“治理 → 数据与审计 → 配置 API Key”，密钥经本机 BFF 分别验证 `OPENAI_MODEL` 和 `OPENAI_FAST_MODEL` 权限后，仅保存在服务进程内存中，重启 BFF 自动清除。
-
-主模型默认 `gpt-5.6`，简单 T0/T1 场景可路由至 `gpt-5.6-terra`。Terra 低置信、拒答、结构或策略失败时最多升级一次；Terra 不可用时使用主模型单路模式；主模型失败后阻断。
-
-临时密钥不会写入 SQLite、`localStorage`、领域数据、审计日志、前端日志或 API 响应，也不会显示密钥后缀。候选密钥和主模型验证成功前不会替换当前可用配置。不要把密钥粘贴到聊天、截图或提交到 Git。
-
-## 命令
+## 测试
 
 ```bash
 npm test
@@ -44,30 +61,22 @@ npm run test:e2e
 npm run preview
 ```
 
-真实模型冒烟测试仅显式启用：
+CI 不配置真实供应商密钥，只运行 Adapter Mock 合约、确定性检索和固定回放。真实供应商连接测试需显式开启对应环境开关，完整 88 条 Holdout 必须由负责人在治理页确认 API 用量后启动。
 
-```bash
-RUN_LIVE_OPENAI_TEST=1 npm run test:live
-```
+## 数据与安全边界
 
-## 数据边界
-
-- 默认 HTTP + SQLite；Mock 模式只用于隔离单元测试和离线演示，命名空间为 `trust-to-action-dogfood-v2-2`。
-- 演示身份由 BFF 签发 HttpOnly、SameSite=Strict 的签名会话，写请求校验 CSRF Token；服务端决定角色、租户和销售客户范围。
-- `SESSION_SECRET` 在非开发环境必须配置。开发环境缺失时使用启动期临时密钥，并在健康状态中提示重启后会话失效。
-- 所有版本化写入检查对象 revision 和 Repository revision，409 冲突不覆盖最新状态。
+- 默认 HTTP + SQLite；Mock 仅用于隔离单元测试和离线演示。
+- 演示身份由 BFF 签发 HttpOnly、SameSite=Strict 签名会话；写请求校验 CSRF Token。
+- 服务端决定角色、租户和销售客户范围，不信任前端角色请求头。
+- `SESSION_SECRET` 在非开发环境必须配置；开发环境缺失时使用启动期临时密钥并显示健康警告。
+- SQLite 不保存 API Key；日志、审计、响应、候选和浏览器状态不包含密钥。
+- Profile 切换会让待处理候选过期，不改写历史结果或反转已采用客户状态。
 - 不接真实企微、V1、`landing-page`、Firestore、Cloud Run 或 `leads`。
-- 所有发布、私聊、客服回复和 Offer 发送均由人执行。
-- 会话存档、朋友圈互动和业务结果全部为确定性合成数据：36 个会话、252 条消息、12 个洞察、8 个 Brief、8 个历史发布和 6 个业务结果。
-- AI 质量数据包含 440 条纯合成黄金集（352 条调优集、88 条锁定 Holdout），覆盖策略、Brief、草稿和 NBA。CI 只运行确定性检索、Mock OpenAI 合约和固定回放。
-- 完整 88 条真实 OpenAI Holdout 必须由负责人在质量中心显式确认 API 用量，最大并发 2；逐案例状态、token、response ID 和幂等键写入 SQLite，支持暂停与断点续跑。CI 和默认本地测试不会产生该用量。
-- Prompt 使用代码内类型化 builder 与内容哈希版本化；知识包、企业事实、模型路由或确定性策略变化会让待审候选过期。
-- 运营只查看聚类和脱敏引用；销售仅可按审计用途查看本人合成会话原文，负责人可按需查看全部。
-- 发布后结果固定按 7 天时间窗口关联，平台互动与销售业务结果分层展示，不宣称因果。
+- 会话、朋友圈互动、客户、内容和业务结果均为合成数据。
+- 所有发布、私聊、客服回复、报价和 Offer 发送均由人执行。
 
 ## 仓库维护
 
-- `main` 保持可运行，后续开发通过功能分支和 Pull Request 合并。
-- Pull Request 和 `main` 推送会运行单元测试、构建和 Playwright 全流程。
-- 不要提交真实客户数据、聊天记录、API Key、`.env`、构建产物或测试报告。
-- 本仓库当前未提供开源许可证。源代码公开可见，但保留全部权利，未经许可不得复制、修改或分发。
+- `main` 保持可运行，后续开发使用功能分支和 Pull Request。
+- 不提交真实客户数据、聊天记录、私有知识包、API Key、`.env`、SQLite、构建产物或测试报告。
+- 本仓库未提供开源许可证。源代码公开可见，但保留全部权利，未经许可不得复制、修改或分发。

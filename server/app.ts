@@ -8,8 +8,9 @@ import { archiveMessageEligibility, redactArchiveText, validateCustomerEvaluatio
 import { actorForRole, can, canAccessCustomer } from "../src/domain/permissions";
 import { calculateQualityMetrics, evidenceFingerprint } from "../src/domain/quality";
 import { StateDataClient } from "../src/data/client";
-import type { AnalysisBatch, ApiProblem, ArchiveConsent, ArchivedMessage, ContentBrief, ConversationInsight, Customer, DomainState, Draft, EvaluationCandidate, EvaluationDecisionKind, EvaluationReasonCode, EvaluationReviewOutcome, GenerationRun, MarketingDecisionCandidate, MarketingDecisionKind, MarketingDecisionOutput, MarketingDecisionReasonCode, MarketingReviewOutcome, MarketingTaskType, Proof, Role } from "../src/domain/types";
+import type { AiCredentialSource, AnalysisBatch, ApiProblem, ArchiveConsent, ArchivedMessage, ContentBrief, ConversationInsight, Customer, DomainState, Draft, EvaluationCandidate, EvaluationDecisionKind, EvaluationReasonCode, EvaluationReviewOutcome, GenerationRun, MarketingDecisionCandidate, MarketingDecisionKind, MarketingDecisionOutput, MarketingDecisionReasonCode, MarketingReviewOutcome, MarketingTaskType, ModelProfileVersion, Proof, ProviderConnectionProfile, Role } from "../src/domain/types";
 import { AiServiceError, type AiConfiguration, type AiService, type ConfigurableAiService } from "./ai-service";
+import { PROVIDER_CATALOG } from "./ai-adapters";
 import { RepositoryConflictError, SqliteStateRepository, type StateRepository } from "./repository";
 import { SessionManager } from "./session";
 import { KnowledgeService } from "./knowledge-service";
@@ -74,6 +75,27 @@ const AiConfigurationRequestSchema = z.object({
   model: z.string().trim().min(1).max(80).regex(/^[a-zA-Z0-9._-]+$/u),
 });
 
+const ProviderConnectionRequestSchema = z.object({
+  name: z.string().trim().min(3).max(80),
+  provider: z.enum(["openai", "deepseek", "anthropic", "qwen", "custom"]),
+  endpoint_scope: z.enum(["public_cloud", "private"]),
+  protocol: z.enum(["openai_responses", "openai_chat", "anthropic_messages"]),
+  base_url: z.string().trim().url().max(300),
+  region: z.string().trim().min(2).max(80),
+  auth_mode: z.enum(["bearer", "x-api-key", "none"]),
+  credential_ref: z.string().trim().regex(/^[A-Z][A-Z0-9_]{2,63}$/u).nullable().default(null),
+});
+const ModelProfileRequestSchema = z.object({
+  name: z.string().trim().min(3).max(80),
+  connection_profile_id: z.string().min(3).max(120),
+  primary_model: z.string().trim().min(1).max(120).regex(/^[a-zA-Z0-9._:/-]+$/u),
+  fallback_model: z.string().trim().min(1).max(120).regex(/^[a-zA-Z0-9._:/-]+$/u).nullable().default(null),
+});
+const ConnectionTestRequestSchema = z.object({ profile_id: z.string(), api_key: z.string().trim().min(8).max(1024).optional(), expected_revision: z.number().int().min(1) });
+const ProfileSmokeRequestSchema = z.object({ expected_revision: z.number().int().min(1) });
+const ProfileActivationRequestSchema = z.object({ expected_revision: z.number().int().min(1), data_egress_acknowledged: z.boolean().default(false) });
+const ProfileHoldoutRequestSchema = z.object({ usage_confirmed: z.literal(true), idempotency_key: z.string().min(16).max(160) });
+
 const ExpectedRevisionSchema = z.object({ expected_revision: z.number().int().min(0) });
 const DemoRoleSchema = z.object({ role: z.enum(["operations", "sales", "lead"]) });
 const CandidateDecisionSchema = z.object({
@@ -120,7 +142,7 @@ function isConfigurable(service: AiService): service is ConfigurableAiService {
 function describeConfiguration(service: AiService): AiConfiguration {
   return isConfigurable(service)
     ? service.getConfiguration()
-    : { configured: service.configured, model: service.model, fast_model: service.fastModel ?? "gpt-5.6-terra", fast_model_available: true, source: service.configured ? "environment" : "none", configured_at: null };
+    : { configured: service.configured, provider: "openai", protocol: "openai_responses", endpoint_scope: "public_cloud", connection_profile_id: "connection-openai", model_profile_version_id: "model-profile-openai", model: service.model, fallback_model: service.fastModel ?? null, fast_model: service.fastModel ?? service.model, fast_model_available: Boolean(service.fastModel), source: service.configured ? "environment" : "none", configured_at: null };
 }
 
 function assertLocalConfigurationRequest(request: Request) {
@@ -178,6 +200,8 @@ function stateForRole(state: DomainState, role: Role) {
     evaluation_decisions: withRole.evaluation_decisions.filter((item) => item.actor === actor && customerIds.has(item.customer_id)),
     marketing_candidates: withRole.marketing_candidates.filter((item) => item.task_type === "customer_nba" && customerIds.has(item.subject_id)),
     marketing_decisions: withRole.marketing_decisions.filter((item) => item.task_type === "customer_nba" && item.actor === actor && customerIds.has(item.subject_id)),
+    model_profiles: withRole.model_profiles.filter((item) => item.status === "active"),
+    provider_connections: withRole.provider_connections.filter((item) => withRole.model_profiles.some((profile) => profile.status === "active" && profile.connection_profile_id === item.id)).map((item) => ({ ...item, base_url: "已隐藏", credential_ref: null, credential_available: false })),
     audits: withRole.audits.filter((item) => item.actor === actor),
   };
 }
@@ -561,7 +585,7 @@ export function createApp({
 
   app.get("/api/v2/health", (_request, response) => {
     const configuration = describeConfiguration(aiService);
-    response.json({ ok: true, ai_configured: configuration.configured, knowledge_configured: knowledgeService.configured, model: configuration.model, fast_model: configuration.fast_model, fast_model_available: configuration.fast_model_available, config_source: configuration.source, configured_at: configuration.configured_at, data_mode: "http-sqlite", session_warning: sessionManager.securityWarning });
+    response.json({ ok: true, ai_configured: configuration.configured, knowledge_configured: knowledgeService.configured, provider: configuration.provider, protocol: configuration.protocol, endpoint_scope: configuration.endpoint_scope, connection_profile_id: configuration.connection_profile_id, model_profile_version_id: configuration.model_profile_version_id, model: configuration.model, fallback_model: configuration.fallback_model, fast_model: configuration.fast_model, fast_model_available: configuration.fast_model_available, config_source: configuration.source, configured_at: configuration.configured_at, data_mode: "http-sqlite", session_warning: sessionManager.securityWarning });
   });
 
   app.get("/api/v2/ai/config", (_request, response) => {
@@ -582,6 +606,141 @@ export function createApp({
       assertLocalConfigurationRequest(request);
       if (!isConfigurable(aiService)) throw new AiServiceError(501, "LOCAL_CONFIG_UNAVAILABLE", "当前 BFF 不支持运行时配置。", false);
       response.json(aiService.resetRuntimeConfiguration());
+    } catch (error) { next(error); }
+  });
+
+  app.get("/api/v2/ai/providers", (_request, response) => response.json({ providers: PROVIDER_CATALOG }));
+
+  app.get("/api/v2/ai/connections", (request, response, next) => {
+    try {
+      if (request.ttaSession.role === "sales") throw new AiServiceError(403, "FORBIDDEN", "销售角色不能查看模型连接配置。", false);
+      const state = repository.load(request.ttaSession.tenant_id).state;
+      response.json({ connections: state.provider_connections, profiles: state.model_profiles, active: describeConfiguration(aiService) });
+    } catch (error) { next(error); }
+  });
+
+  app.get("/api/v2/ai/model-profiles", (request, response) => {
+    const state = stateForRole(repository.load(request.ttaSession.tenant_id).state, request.ttaSession.role);
+    response.json({ profiles: state.model_profiles, active: describeConfiguration(aiService) });
+  });
+
+  app.post("/api/v2/ai/connections", async (request, response, next) => {
+    try {
+      assertLocalConfigurationRequest(request);
+      const input = ProviderConnectionRequestSchema.parse(request.body);
+      const createdAt = new Date().toISOString();
+      const connection: ProviderConnectionProfile = {
+        id: `connection-${crypto.randomUUID()}`, revision: 1, updated_at: createdAt, tenant_id: request.ttaSession.tenant_id,
+        ...input, credential_source: "none", credential_available: input.auth_mode === "none",
+        capabilities: { structured_output: false, native_json_schema: false, refusal_signal: false, usage_reporting: false, request_id: false, tested_at: null, notes: ["等待连接测试"] },
+        last_tested_at: null, last_error_code: null, created_by: actorForRole(request.ttaSession.role),
+      };
+      response.status(201).json(await mutateState(repository, request, (client) => client.createProviderConnection(connection)));
+    } catch (error) { next(error); }
+  });
+
+  app.post("/api/v2/ai/model-profiles", async (request, response, next) => {
+    try {
+      assertLocalConfigurationRequest(request);
+      const input = ModelProfileRequestSchema.parse(request.body);
+      const state = repository.load(request.ttaSession.tenant_id).state;
+      const connection = state.provider_connections.find((item) => item.id === input.connection_profile_id);
+      if (!connection) throw new AiServiceError(404, "CONNECTION_NOT_FOUND", "模型连接不存在。", false);
+      const createdAt = new Date().toISOString();
+      const profile: ModelProfileVersion = {
+        id: `model-profile-${crypto.randomUUID()}`, revision: 1, updated_at: createdAt, tenant_id: request.ttaSession.tenant_id, name: input.name,
+        connection_profile_id: connection.id, provider: connection.provider, protocol: connection.protocol, endpoint_scope: connection.endpoint_scope,
+        primary_model: input.primary_model, fallback_model: input.fallback_model, status: "draft", smoke_passed_at: null, smoke_case_count: 0, holdout_run_id: null,
+        data_egress_acknowledged_by: null, data_egress_acknowledged_at: null, activated_by: null, activated_at: null, previous_profile_id: null, created_by: actorForRole(request.ttaSession.role),
+      };
+      response.status(201).json(await mutateState(repository, request, (client) => client.createModelProfile(profile)));
+    } catch (error) { next(error); }
+  });
+
+  app.post("/api/v2/ai/connections/:id/test", async (request, response, next) => {
+    try {
+      assertLocalConfigurationRequest(request);
+      if (!isConfigurable(aiService)) throw new AiServiceError(501, "LOCAL_CONFIG_UNAVAILABLE", "当前 BFF 不支持多模型连接配置。", false);
+      const input = ConnectionTestRequestSchema.parse(request.body);
+      const state = repository.load(request.ttaSession.tenant_id).state;
+      const connection = state.provider_connections.find((item) => item.id === request.params.id);
+      const profile = state.model_profiles.find((item) => item.id === input.profile_id && item.connection_profile_id === request.params.id);
+      if (!connection || !profile) throw new AiServiceError(404, "PROFILE_NOT_FOUND", "模型连接或 Profile 不存在。", false);
+      if (connection.revision !== input.expected_revision) throw new AiServiceError(409, "VERSION_CONFLICT", "模型连接已更新，请刷新后重试。", true);
+      const capability = await aiService.testConnection(connection, profile, input.api_key);
+      const source: AiCredentialSource = connection.auth_mode === "none" ? "none" : input.api_key ? "runtime" : connection.credential_ref ? "environment" : "none";
+      response.json(await mutateState(repository, request, (client) => client.recordConnectionTest(connection.id, capability, source, input.expected_revision)));
+    } catch (error) { next(error); }
+  });
+
+  app.delete("/api/v2/ai/connections/:id/runtime-secret", async (request, response, next) => {
+    try {
+      assertLocalConfigurationRequest(request);
+      if (!isConfigurable(aiService)) throw new AiServiceError(501, "LOCAL_CONFIG_UNAVAILABLE", "当前 BFF 不支持多模型连接配置。", false);
+      aiService.clearRuntimeSecret(request.params.id);
+      response.json(await mutateState(repository, request, (client) => client.clearConnectionCredential(request.params.id)));
+    } catch (error) { next(error); }
+  });
+
+  app.post("/api/v2/ai/model-profiles/:id/smoke", createRateLimiter(4), async (request, response, next) => {
+    try {
+      assertLocalConfigurationRequest(request);
+      if (!isConfigurable(aiService)) throw new AiServiceError(501, "LOCAL_CONFIG_UNAVAILABLE", "当前 BFF 不支持多模型评测。", false);
+      const input = ProfileSmokeRequestSchema.parse(request.body);
+      const state = repository.load(request.ttaSession.tenant_id).state;
+      const profile = state.model_profiles.find((item) => item.id === request.params.id);
+      const connection = state.provider_connections.find((item) => item.id === profile?.connection_profile_id);
+      if (!profile || !connection) throw new AiServiceError(404, "PROFILE_NOT_FOUND", "模型 Profile 不存在。", false);
+      if (profile.revision !== input.expected_revision) throw new AiServiceError(409, "VERSION_CONFLICT", "模型 Profile 已更新，请刷新后重试。", true);
+      const smoke = await aiService.runSmoke(connection, profile);
+      if (smoke.passed !== smoke.total || smoke.total !== 14) throw new AiServiceError(422, "SMOKE_FAILED", `模型 Smoke 仅通过 ${smoke.passed}/${smoke.total}。`, false);
+      response.json(await mutateState(repository, request, (client) => client.markModelProfileSmoke(profile.id, input.expected_revision)));
+    } catch (error) { next(error); }
+  });
+
+  app.post("/api/v2/ai/model-profiles/:id/activate", async (request, response, next) => {
+    try {
+      assertLocalConfigurationRequest(request);
+      if (request.ttaSession.role !== "lead") throw new AiServiceError(403, "FORBIDDEN", "只有负责人可以激活全局模型 Profile。", false);
+      if (!isConfigurable(aiService)) throw new AiServiceError(501, "LOCAL_CONFIG_UNAVAILABLE", "当前 BFF 不支持多模型激活。", false);
+      const input = ProfileActivationRequestSchema.parse(request.body);
+      const state = repository.load(request.ttaSession.tenant_id).state;
+      const profile = state.model_profiles.find((item) => item.id === request.params.id);
+      const connection = state.provider_connections.find((item) => item.id === profile?.connection_profile_id);
+      if (!profile || !connection) throw new AiServiceError(404, "PROFILE_NOT_FOUND", "模型 Profile 不存在。", false);
+      if (profile.revision !== input.expected_revision) throw new AiServiceError(409, "VERSION_CONFLICT", "模型 Profile 已更新，请刷新后重试。", true);
+      if (!["trial_ready", "enterprise_ready", "active"].includes(profile.status)) throw new AiServiceError(422, "SMOKE_REQUIRED", "模型 Profile 必须先通过 14 条 Smoke。", false);
+      if (profile.endpoint_scope === "public_cloud" && !input.data_egress_acknowledged) throw new AiServiceError(422, "DATA_EGRESS_ACK_REQUIRED", "激活公有云模型前必须确认数据去向。", false);
+      aiService.activateProfile(connection, profile);
+      response.json(await mutateState(repository, request, (client) => client.activateModelProfile(profile.id, input.expected_revision, input.data_egress_acknowledged)));
+    } catch (error) { next(error); }
+  });
+
+  app.post("/api/v2/ai/model-profiles/:id/rollback", async (request, response, next) => {
+    try {
+      assertLocalConfigurationRequest(request);
+      if (request.ttaSession.role !== "lead") throw new AiServiceError(403, "FORBIDDEN", "只有负责人可以回滚全局模型 Profile。", false);
+      if (!isConfigurable(aiService)) throw new AiServiceError(501, "LOCAL_CONFIG_UNAVAILABLE", "当前 BFF 不支持多模型回滚。", false);
+      const activeState = repository.load(request.ttaSession.tenant_id).state;
+      const activeProfile = activeState.model_profiles.find((item) => item.status === "active" && item.id === request.params.id);
+      const previous = activeState.model_profiles.find((item) => item.id === activeProfile?.previous_profile_id);
+      const connection = activeState.provider_connections.find((item) => item.id === previous?.connection_profile_id);
+      if (!activeProfile || !previous || !connection) throw new AiServiceError(409, "ROLLBACK_UNAVAILABLE", "当前 Profile 没有可回滚的上一版本。", false);
+      aiService.activateProfile(connection, previous);
+      response.json(await mutateState(repository, request, (client) => client.activateModelProfile(previous.id, previous.revision, true)));
+    } catch (error) { next(error); }
+  });
+
+  app.post("/api/v2/ai/model-profiles/:id/holdout", (request, response, next) => {
+    try {
+      if (request.ttaSession.role !== "lead") throw new AiServiceError(403, "FORBIDDEN", "只有负责人可以确认用量并启动完整 Holdout。", false);
+      const input = ProfileHoldoutRequestSchema.parse(request.body);
+      const state = repository.load(request.ttaSession.tenant_id).state;
+      const profile = state.model_profiles.find((item) => item.id === request.params.id && item.status === "active");
+      const brain = state.marketing_brain_versions.find((item) => item.status === "published");
+      if (!profile || !brain) throw new AiServiceError(409, "MODEL_PROFILE_BINDING_MISMATCH", "只有当前激活且已绑定营销脑的 Profile 可以运行 Holdout。", false);
+      const next = liveHoldoutRunner.start({ tenantId: request.ttaSession.tenant_id, actor: actorForRole(request.ttaSession.role), marketingBrainVersionId: brain.id, routerVersionId: brain.model_router_version_id, modelProfileVersionId: profile.id, idempotencyKey: input.idempotency_key });
+      response.status(202).json(stateForRole(next, request.ttaSession.role));
     } catch (error) { next(error); }
   });
 
@@ -688,11 +847,12 @@ export function createApp({
       result = await aiService.customerEvaluation({ customer });
     } catch (cause) {
       const failure = asServiceError(cause) as AiServiceError;
+      const configuration = describeConfiguration(aiService);
       const createdAt = new Date().toISOString();
       const run: GenerationRun = {
         id: `run-${crypto.randomUUID()}`, revision: 1, updated_at: createdAt, task: "customer_evaluation", subject_id: customer.id,
-        status: failure.status === 422 ? "blocked" : "failed", model: aiService.model, prompt_version: "customer-eval-v2.1.0-rc1",
-        router_version: "router-v2.1-risk-first", route_reason: "generation_failed", attempts: [{ model: aiService.model, status: "failed", latency_ms: Date.now() - startedAt, response_id: null, error_code: failure.code }],
+        status: failure.status === 422 ? "blocked" : "failed", provider: configuration.provider, protocol: configuration.protocol, connection_profile_id: configuration.connection_profile_id, model_profile_version_id: configuration.model_profile_version_id, endpoint_scope: configuration.endpoint_scope, model: aiService.model, prompt_version: "customer-eval-v2.3.0",
+        router_version: "global-profile-v2.3", route_reason: "generation_failed", attempts: [{ provider: configuration.provider, protocol: configuration.protocol, endpoint_scope: configuration.endpoint_scope, model: aiService.model, status: "failed", latency_ms: Date.now() - startedAt, response_id: null, error_code: failure.code }],
         latency_ms: Date.now() - startedAt, input_tokens: 0, output_tokens: 0, input_fingerprint: fingerprint, response_id: null, error_code: failure.code, created_at: createdAt,
       };
       await mutateState(repository, request, (client) => client.saveGenerationRun(run));
@@ -705,8 +865,8 @@ export function createApp({
       const createdAt = new Date().toISOString();
       const run: GenerationRun = {
         id: `run-${crypto.randomUUID()}`, revision: 1, updated_at: createdAt, task: "customer_evaluation", subject_id: customer.id,
-        status: "blocked", model: result.meta.model, prompt_version: result.meta.prompt_version, router_version: result.meta.router_version ?? "router-v2.1-risk-first", route_reason: result.meta.route_reason ?? "policy_blocked",
-        attempts: [{ model: result.meta.model, status: "failed", latency_ms: result.meta.latency_ms ?? Date.now() - startedAt, response_id: result.meta.response_id, error_code: policy.code }], latency_ms: result.meta.latency_ms ?? Date.now() - startedAt,
+        status: "blocked", provider: result.meta.provider, protocol: result.meta.protocol, connection_profile_id: result.meta.connection_profile_id, model_profile_version_id: result.meta.model_profile_version_id, endpoint_scope: result.meta.endpoint_scope, model: result.meta.model, prompt_version: result.meta.prompt_version, router_version: result.meta.router_version ?? "global-profile-v2.3", route_reason: result.meta.route_reason ?? "policy_blocked",
+        attempts: [{ provider: result.meta.provider, protocol: result.meta.protocol, endpoint_scope: result.meta.endpoint_scope, model: result.meta.model, status: "failed", latency_ms: result.meta.latency_ms ?? Date.now() - startedAt, response_id: result.meta.response_id, error_code: policy.code }], latency_ms: result.meta.latency_ms ?? Date.now() - startedAt,
         input_tokens: result.meta.input_tokens ?? 0, output_tokens: result.meta.output_tokens ?? 0, input_fingerprint: fingerprint, response_id: result.meta.response_id, error_code: policy.code, created_at: createdAt,
       };
       await mutateState(repository, request, (client) => client.saveGenerationRun(run));
@@ -725,13 +885,18 @@ export function createApp({
       task: "customer_evaluation",
       subject_id: customer.id,
       status: "success",
+      provider: meta.provider,
+      protocol: meta.protocol,
+      connection_profile_id: meta.connection_profile_id,
+      model_profile_version_id: meta.model_profile_version_id,
+      endpoint_scope: meta.endpoint_scope,
       model: meta.model,
       prompt_version: meta.prompt_version,
-      router_version: meta.router_version ?? "router-v2.1-risk-first",
+      router_version: meta.router_version ?? "global-profile-v2.3",
       route_reason: meta.route_reason ?? "primary_default",
       attempts: attempts > 1 && meta.escalated_from
-        ? [{ model: meta.escalated_from, status: "escalated", latency_ms: 0, response_id: null, error_code: "ROUTER_ESCALATED" }, { model: meta.model, status: "success", latency_ms: meta.latency_ms ?? 0, response_id: meta.response_id, error_code: null }]
-        : [{ model: meta.model, status: "success", latency_ms: meta.latency_ms ?? 0, response_id: meta.response_id, error_code: null }],
+        ? [{ provider: meta.provider, protocol: meta.protocol, endpoint_scope: meta.endpoint_scope, model: meta.escalated_from, status: "escalated", latency_ms: 0, response_id: null, error_code: "MODEL_FALLBACK" }, { provider: meta.provider, protocol: meta.protocol, endpoint_scope: meta.endpoint_scope, model: meta.model, status: "success", latency_ms: meta.latency_ms ?? 0, response_id: meta.response_id, error_code: null }]
+        : [{ provider: meta.provider, protocol: meta.protocol, endpoint_scope: meta.endpoint_scope, model: meta.model, status: "success", latency_ms: meta.latency_ms ?? 0, response_id: meta.response_id, error_code: null }],
       latency_ms: meta.latency_ms ?? 0,
       input_tokens: meta.input_tokens ?? 0,
       output_tokens: meta.output_tokens ?? 0,

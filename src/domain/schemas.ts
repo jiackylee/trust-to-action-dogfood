@@ -138,6 +138,11 @@ export type WeeklyRetrospective = z.infer<typeof WeeklyRetrospectiveSchema>;
 
 export const AiMetaSchema = z.object({
   model: z.string(),
+  provider: z.enum(["openai", "deepseek", "anthropic", "qwen", "custom"]).optional(),
+  protocol: z.enum(["openai_responses", "openai_chat", "anthropic_messages"]).optional(),
+  connection_profile_id: z.string().optional(),
+  model_profile_version_id: z.string().optional(),
+  endpoint_scope: z.enum(["public_cloud", "private"]).optional(),
   response_id: z.string(),
   prompt_version: z.string(),
   generated_at: z.string(),
@@ -148,6 +153,7 @@ export const AiMetaSchema = z.object({
   input_tokens: z.number().int().min(0).optional(),
   output_tokens: z.number().int().min(0).optional(),
   escalated_from: z.string().nullable().optional(),
+  fallback_from: z.string().nullable().optional(),
   input_fingerprint: z.string().optional(),
 });
 export type AiMeta = z.infer<typeof AiMetaSchema>;

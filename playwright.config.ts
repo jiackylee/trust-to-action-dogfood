@@ -15,7 +15,7 @@ export default defineConfig({
     env: {
       ...process.env,
       KNOWLEDGE_PACK_PATH: process.env.KNOWLEDGE_PACK_PATH || path.resolve("knowledge-sample"),
-      DATA_DB_PATH: process.env.DATA_DB_PATH || path.resolve("data/playwright-v2.2.sqlite"),
+      DATA_DB_PATH: process.env.DATA_DB_PATH || path.resolve("data/playwright-v2.3.sqlite"),
     },
   },
 });

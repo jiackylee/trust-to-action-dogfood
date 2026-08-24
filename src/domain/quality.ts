@@ -42,7 +42,8 @@ export function calculateQualityMetrics(state: DomainState): AiQualityMetrics {
   const mature = reviewed.filter((item) => item.review_outcome !== null);
   const retained = mature.filter((item) => item.decision === "accepted" && item.review_outcome !== "quality_reversal");
   const completedCandidates = state.evaluation_candidates.filter((item) => ["accepted", "modified", "rejected"].includes(item.status));
-  const successfulRuns = state.generation_runs.filter((item) => item.status === "success");
+  const generationRuns = state.generation_runs;
+  const successfulRuns = generationRuns.filter((item) => item.status === "success");
   const latestEval = state.eval_runs.filter((item) => item.status === "completed" && item.score).at(-1)?.score;
   const baseline = state.eval_runs.find((item) => item.id === "eval-baseline-holdout")?.score?.first_draft_adoption ?? 0;
   const knownSources = new Set(state.knowledge_sources.filter((item) => item.status === "ready").map((item) => item.id));
@@ -69,6 +70,53 @@ export function calculateQualityMetrics(state: DomainState): AiQualityMetrics {
   const allKnowledgeRefs = state.marketing_candidates.flatMap((item) => item.envelope.knowledge_refs);
   const businessIds = new Set([...state.customers.flatMap((item) => item.evidence.map((evidence) => evidence.id)), ...state.conversation_insights.map((item) => item.id), ...state.proofs.map((item) => item.id)]);
   const allBusinessRefs = state.marketing_candidates.flatMap((item) => item.envelope.business_evidence_refs);
+  const providers = new Set([
+    ...generationRuns.map((item) => item.provider ?? "openai"),
+    ...state.marketing_candidates.map((item) => item.envelope.ai_meta.provider ?? "openai"),
+  ]);
+  const providerSlices = Object.fromEntries([...providers].map((provider) => {
+    const runs = generationRuns.filter((item) => (item.provider ?? "openai") === provider);
+    const marketing = state.marketing_candidates.filter((item) => (item.envelope.ai_meta.provider ?? "openai") === provider);
+    const total = runs.length + marketing.length;
+    return [provider, {
+      runs: total,
+      success_rate: percentage(runs.filter((item) => item.status === "success").length + marketing.length, total),
+      fallback_rate: percentage(runs.filter((item) => item.attempts.length > 1).length, runs.length),
+      p95_latency_ms: percentile95([...runs.map((item) => item.latency_ms), ...marketing.map((item) => item.envelope.ai_meta.latency_ms ?? 0)]),
+      input_tokens: runs.reduce((sum, item) => sum + item.input_tokens, 0) + marketing.reduce((sum, item) => sum + (item.envelope.ai_meta.input_tokens ?? 0), 0),
+      output_tokens: runs.reduce((sum, item) => sum + item.output_tokens, 0) + marketing.reduce((sum, item) => sum + (item.envelope.ai_meta.output_tokens ?? 0), 0),
+    }];
+  }));
+  const profileKeys = new Set([
+    ...generationRuns.map((item) => item.model_profile_version_id ?? `legacy:${item.provider ?? "openai"}:${item.model}`),
+    ...state.marketing_candidates.map((item) => item.envelope.ai_meta.model_profile_version_id ?? `legacy:${item.envelope.ai_meta.provider ?? "openai"}:${item.envelope.ai_meta.model}`),
+  ]);
+  const profileSlices = Object.fromEntries([...profileKeys].map((profileId) => {
+    const profile = state.model_profiles.find((item) => item.id === profileId);
+    const runs = generationRuns.filter((item) => (item.model_profile_version_id ?? `legacy:${item.provider ?? "openai"}:${item.model}`) === profileId);
+    const marketing = state.marketing_candidates.filter((item) => (item.envelope.ai_meta.model_profile_version_id ?? `legacy:${item.envelope.ai_meta.provider ?? "openai"}:${item.envelope.ai_meta.model}`) === profileId);
+    const sampleRun = runs[0];
+    const sampleMeta = marketing[0]?.envelope.ai_meta;
+    const provider = profile?.provider ?? sampleRun?.provider ?? sampleMeta?.provider ?? "openai";
+    const protocol = profile?.protocol ?? sampleRun?.protocol ?? sampleMeta?.protocol ?? "openai_responses";
+    const endpointScope = profile?.endpoint_scope ?? sampleRun?.endpoint_scope ?? sampleMeta?.endpoint_scope ?? "public_cloud";
+    const model = profile?.primary_model ?? sampleRun?.model ?? sampleMeta?.model ?? "unknown";
+    const total = runs.length + marketing.length;
+    return [profileId, {
+      profile_id: profileId,
+      profile_name: profile?.name ?? "历史迁移 Profile",
+      provider,
+      protocol,
+      endpoint_scope: endpointScope,
+      model,
+      runs: total,
+      success_rate: percentage(runs.filter((item) => item.status === "success").length + marketing.length, total),
+      fallback_rate: percentage(runs.filter((item) => item.attempts.length > 1).length + marketing.filter((item) => (item.envelope.ai_meta.attempts ?? 1) > 1).length, total),
+      p95_latency_ms: percentile95([...runs.map((item) => item.latency_ms), ...marketing.map((item) => item.envelope.ai_meta.latency_ms ?? 0)]),
+      input_tokens: runs.reduce((sum, item) => sum + item.input_tokens, 0) + marketing.reduce((sum, item) => sum + (item.envelope.ai_meta.input_tokens ?? 0), 0),
+      output_tokens: runs.reduce((sum, item) => sum + item.output_tokens, 0) + marketing.reduce((sum, item) => sum + (item.envelope.ai_meta.output_tokens ?? 0), 0),
+    }];
+  }));
   return {
     first_draft_adoption_rate: percentage(retained.length, mature.length), baseline_adoption_rate: baseline,
     review_coverage_rate: percentage(completedCandidates.length, state.evaluation_candidates.length), reviewed_candidates: reviewed.length, mature_candidates: mature.length,
@@ -76,7 +124,7 @@ export function calculateQualityMetrics(state: DomainState): AiQualityMetrics {
     stale_candidates: state.evaluation_candidates.filter((item) => item.status === "stale" || (item.status === "pending" && candidateIsStale(state, item))).length,
     state_accuracy: latestEval?.state_accuracy ?? 0, nba_acceptability: latestEval?.nba_acceptability ?? 0, evidence_precision: latestEval?.evidence_precision ?? 0,
     p95_latency_ms: percentile95([...successfulRuns.map((item) => item.latency_ms), ...state.marketing_candidates.map((item) => item.envelope.ai_meta.latency_ms ?? 0)]),
-    fast_model_share: percentage(successfulRuns.filter((item) => item.model === "gpt-5.6-terra").length, successfulRuns.length),
+    fast_model_share: percentage(successfulRuns.filter((item) => item.attempts.length > 1).length, successfulRuns.length),
     escalation_rate: percentage(successfulRuns.filter((item) => item.attempts.length > 1).length, successfulRuns.length),
     policy_violations: latestEval?.policy_violations ?? 0, privacy_leaks: latestEval?.privacy_leaks ?? 0,
     macro_adoption_rate: macro, task_slices: taskSlices, knowledge_recall_at_5: latestEval?.knowledge_recall_at_5 ?? 0,
@@ -84,6 +132,7 @@ export function calculateQualityMetrics(state: DomainState): AiQualityMetrics {
     business_evidence_precision: percentage(allBusinessRefs.filter((item) => businessIds.has(item)).length, allBusinessRefs.length),
     forbidden_source_hits: latestEval?.forbidden_source_hits ?? 0, unsupported_facts: latestEval?.unsupported_facts ?? 0,
     retrieval_hit_rate: percentage(state.knowledge_retrieval_runs.filter((item) => item.result_count > 0).length, state.knowledge_retrieval_runs.length),
+    provider_slices: providerSlices, profile_slices: profileSlices,
   };
 }
 

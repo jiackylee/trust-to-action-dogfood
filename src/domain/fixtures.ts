@@ -378,13 +378,13 @@ function makeKnowledgeFixtures() {
       id: "brain-v2.2-published", revision: 2, updated_at: NOW, name: "营销大脑 2.2-RC1", status: "published",
       prompt_hashes: { weekly_strategy: "prompt-weekly-a91f", content_brief: "prompt-brief-4c23", content_draft: "prompt-draft-18db", customer_nba: "prompt-nba-730a" },
       skill_router_version: "skill-router-v2.2", retriever_version: "fts5-trigram-v2.2", knowledge_pack_version_id: pack.id, tenant_fact_version_id: facts[0].id,
-      model_router_version_id: "router-v2.1-rc1", policy_version: "policy-v2.2", created_by: "林澈", published_by: "周岚", published_at: NOW,
+      model_router_version_id: "router-v2.1-rc1", model_profile_version_id: "model-profile-openai", policy_version: "policy-v2.2", created_by: "林澈", published_by: "周岚", published_at: NOW,
     },
     {
       id: "brain-v2.2-rc2", revision: 1, updated_at: NOW, name: "营销大脑 2.2-RC2", status: "draft",
       prompt_hashes: { weekly_strategy: "code-weekly-v22rc2", content_brief: "code-brief-v22rc2", content_draft: "code-draft-v22rc2", customer_nba: "code-nba-v22rc2" },
       skill_router_version: "skill-router-v2.2", retriever_version: "fts5-trigram-v2.2", knowledge_pack_version_id: pack.id, tenant_fact_version_id: facts[0].id,
-      model_router_version_id: "router-v2.1-rc1", policy_version: "policy-v2.2", created_by: "代码发布流程", published_by: null, published_at: null,
+      model_router_version_id: "router-v2.1-rc1", model_profile_version_id: "model-profile-openai", policy_version: "policy-v2.2", created_by: "代码发布流程", published_by: null, published_at: null,
     },
   ];
   return { pack, sources, retrievalRuns, facts, brains };
@@ -415,7 +415,7 @@ function makeMarketingDecisionFixtures(customers: Customer[], drafts: Draft[], b
       id: candidateId, revision: decided ? 2 : 1, updated_at: createdAt, task_type: task, subject_id: subject?.id ?? "weekly-plan", subject_revision: subject?.revision ?? 1,
       evidence_fingerprint: `fixture-${task}-${subject?.id ?? "weekly"}`, envelope: { task_type: task, output, business_evidence_refs: task === "customer_nba" ? (output as Customer["evaluation"])!.evidence_refs : ["insight-01", "proof-01"], knowledge_refs: [knowledgeRef],
         skill_route: ["enterprise-wechat-friend-marketing", "marketing-growth-system"], assumptions: ["本周服务容量维持 3 个诊断名额"], knowledge_conflicts: index % 6 === 0 ? ["进攻频率受当前服务容量门禁约束"] : [],
-        measurement_plan: ["48 小时记录采用结果", "发布后 7 天复查业务结果"], growth_posture: "aggressive", ai_meta: { model: task === "content_draft" && index % 3 === 0 ? "gpt-5.6-terra" : "gpt-5.6", response_id: `resp-marketing-${index + 1}`, prompt_version: `code-${task}-v2.2`, generated_at: createdAt, latency_ms: 4300 + index * 120 },
+        measurement_plan: ["48 小时记录采用结果", "发布后 7 天复查业务结果"], growth_posture: "aggressive", ai_meta: { model: "gpt-5.6", provider: "openai", protocol: "openai_responses", endpoint_scope: "public_cloud", connection_profile_id: "connection-openai", model_profile_version_id: "model-profile-openai", response_id: `resp-marketing-${index + 1}`, prompt_version: `code-${task}-v2.2`, generated_at: createdAt, router_version: "global-profile-v2.3", route_reason: "global_primary", attempts: 1, latency_ms: 4300 + index * 120, input_tokens: 880 + index * 7, output_tokens: 310 + index * 3, fallback_from: null },
         knowledge_pack_version: knowledge.pack.id, tenant_fact_version: knowledge.facts[0].id, marketing_brain_version: publishedBrain.id, prompt_hash: publishedBrain.prompt_hashes[task], input_fingerprint: `input-${index + 1}` },
       status: decided ? decisionKind : "pending", created_at: createdAt, expires_at: date(28, 18), decided_at: decided ? date(16 + (index % 7), 11) : null, decision_id: decisionId,
     });
@@ -448,22 +448,32 @@ function makeQualityFixtures(customers: Customer[]) {
     const candidateId = `candidate-${String(index + 1).padStart(2, "0")}`;
     const decided = index < 24;
     const createdAt = date(12 + (index % 11), 9 + (index % 7));
-    const model = index % 3 === 0 ? "gpt-5.6-terra" : "gpt-5.6";
+    const providerConfig = index < 18
+      ? { provider: "openai" as const, protocol: "openai_responses" as const, scope: "public_cloud" as const, profile: "model-profile-openai", primary: "gpt-5.6", fallback: "gpt-5.6-terra" }
+      : index < 24
+        ? { provider: "deepseek" as const, protocol: "openai_responses" as const, scope: "public_cloud" as const, profile: "model-profile-deepseek", primary: "deepseek-chat", fallback: "deepseek-reasoner" }
+        : index < 27
+          ? { provider: "qwen" as const, protocol: "openai_responses" as const, scope: "public_cloud" as const, profile: "model-profile-qwen", primary: "qwen3.8-max", fallback: "qwen3.7-plus" }
+          : index < 29
+            ? { provider: "anthropic" as const, protocol: "anthropic_messages" as const, scope: "public_cloud" as const, profile: "model-profile-anthropic", primary: "claude-sonnet-4-5-20250929", fallback: null }
+            : { provider: "custom" as const, protocol: "openai_chat" as const, scope: "private" as const, profile: "model-profile-private", primary: "enterprise-marketing-32b", fallback: "enterprise-marketing-14b" };
     const escalated = index % 8 === 0;
+    const model = escalated && providerConfig.fallback ? providerConfig.fallback : providerConfig.primary;
     const fingerprint = evidenceFingerprint(customer);
     const decision = index % 6 === 0 ? "modified" as const : index % 9 === 0 ? "rejected" as const : "accepted" as const;
     const decisionId = decided ? `decision-${String(index + 1).padStart(2, "0")}` : null;
     const meta = {
-      model, response_id: `resp-quality-${index + 1}`, prompt_version: index < 12 ? "customer-eval-v2.0.0" : "customer-eval-v2.1.0-rc1", generated_at: createdAt,
-      router_version: "router-v2.1.0-rc1", route_reason: model.includes("terra") ? "simple_t0_t1" : "high_risk_or_complex", attempts: escalated ? 2 : 1,
+      model, provider: providerConfig.provider, protocol: providerConfig.protocol, endpoint_scope: providerConfig.scope, connection_profile_id: `connection-${providerConfig.provider === "custom" ? "private" : providerConfig.provider}`, model_profile_version_id: providerConfig.profile,
+      response_id: `resp-quality-${index + 1}`, prompt_version: index < 12 ? "customer-eval-v2.0.0" : "customer-eval-v2.3.0", generated_at: createdAt,
+      router_version: "global-profile-v2.3", route_reason: escalated && providerConfig.fallback ? "global_fallback:RATE_LIMITED" : "global_primary", attempts: escalated && providerConfig.fallback ? 2 : 1,
       latency_ms: 4200 + index * 170, input_tokens: 720 + index * 4, output_tokens: 260 + index * 3,
-      escalated_from: escalated ? "gpt-5.6-terra" : null, input_fingerprint: fingerprint,
+      escalated_from: escalated && providerConfig.fallback ? providerConfig.primary : null, fallback_from: escalated && providerConfig.fallback ? providerConfig.primary : null, input_fingerprint: fingerprint,
     };
     generationRuns.push({
-      id: runId, revision: 1, updated_at: createdAt, task: "customer_evaluation", subject_id: customer.id, status: "success", model, prompt_version: meta.prompt_version,
+      id: runId, revision: 1, updated_at: createdAt, task: "customer_evaluation", subject_id: customer.id, status: "success", provider: providerConfig.provider, protocol: providerConfig.protocol, endpoint_scope: providerConfig.scope, connection_profile_id: meta.connection_profile_id, model_profile_version_id: providerConfig.profile, model, prompt_version: meta.prompt_version,
       router_version: meta.router_version, route_reason: meta.route_reason, attempts: escalated
-        ? [{ model: "gpt-5.6-terra", status: "escalated", latency_ms: 2100, response_id: null, error_code: "LOW_CONFIDENCE" }, { model: "gpt-5.6", status: "success", latency_ms: meta.latency_ms - 2100, response_id: meta.response_id, error_code: null }]
-        : [{ model, status: "success", latency_ms: meta.latency_ms, response_id: meta.response_id, error_code: null }],
+        && providerConfig.fallback ? [{ provider: providerConfig.provider, protocol: providerConfig.protocol, endpoint_scope: providerConfig.scope, model: providerConfig.primary, status: "escalated", latency_ms: 2100, response_id: null, error_code: "RATE_LIMITED" }, { provider: providerConfig.provider, protocol: providerConfig.protocol, endpoint_scope: providerConfig.scope, model: providerConfig.fallback, status: "success", latency_ms: meta.latency_ms - 2100, response_id: meta.response_id, error_code: null }]
+        : [{ provider: providerConfig.provider, protocol: providerConfig.protocol, endpoint_scope: providerConfig.scope, model, status: "success", latency_ms: meta.latency_ms, response_id: meta.response_id, error_code: null }],
       latency_ms: meta.latency_ms, input_tokens: meta.input_tokens, output_tokens: meta.output_tokens, input_fingerprint: meta.input_fingerprint, response_id: meta.response_id, error_code: null, created_at: createdAt,
     });
     candidates.push({
@@ -491,8 +501,8 @@ function makeAiVersions() {
     { id: "prompt-v2.1-rc1", revision: 1, updated_at: NOW, name: "customer-eval-v2.1.0-rc1", task: "customer_evaluation", status: "draft", description: "证据分层、未知项与 NBA 约束", created_by: "林澈", published_by: null, published_at: null },
   ];
   const routers: RouterVersion[] = [
-    { id: "router-v2.0", revision: 2, updated_at: date(10), name: "router-v2.0-single", status: "published", primary_model: "gpt-5.6", fast_model: "gpt-5.6", confidence_threshold: 0, description: "2.0 单模型基线", created_by: "系统", published_by: "周岚", published_at: date(10) },
-    { id: "router-v2.1-rc1", revision: 1, updated_at: NOW, name: "router-v2.1-risk-first", status: "draft", primary_model: "gpt-5.6", fast_model: "gpt-5.6-terra", confidence_threshold: 75, description: "简单场景走 Terra，高风险直接主模型，只升不降", created_by: "林澈", published_by: null, published_at: null },
+    { id: "router-v2.0", revision: 3, updated_at: NOW, name: "router-v2.0-single", status: "archived", primary_model: "gpt-5.6", fast_model: "gpt-5.6", confidence_threshold: 0, description: "2.0 单模型基线，已迁移为归档 Profile", created_by: "系统", published_by: "周岚", published_at: date(10) },
+    { id: "router-v2.1-rc1", revision: 2, updated_at: NOW, name: "router-v2.1-risk-first", status: "archived", primary_model: "gpt-5.6", fast_model: "gpt-5.6-terra", confidence_threshold: 75, description: "2.1 动态路由基线，仅供旧评测兼容", created_by: "林澈", published_by: null, published_at: null },
   ];
   const evalRuns: EvalRun[] = [{
     id: "eval-baseline-holdout", revision: 1, updated_at: NOW, marketing_brain_version_id: "brain-v2.1-baseline", prompt_version_id: "prompt-v2.0", router_version_id: "router-v2.0", split: "holdout", mode: "replay", status: "completed", case_count: 40,
@@ -500,6 +510,38 @@ function makeAiVersions() {
     started_at: date(21, 9), completed_at: date(21, 10), generated_by: "系统盲测",
   }];
   return { prompts, routers, evalRuns };
+}
+
+function makeProviderProfiles() {
+  const capability = (tested: boolean, notes: string[] = []) => ({
+    structured_output: tested,
+    native_json_schema: tested,
+    refusal_signal: tested,
+    usage_reporting: tested,
+    request_id: tested,
+    tested_at: tested ? NOW : null,
+    notes,
+  });
+  const connections = [
+    { id: "connection-openai", revision: 2, updated_at: NOW, tenant_id: "tenant-dogfood-cn", name: "OpenAI 官方云", provider: "openai" as const, endpoint_scope: "public_cloud" as const, protocol: "openai_responses" as const, base_url: "https://api.openai.com/v1", region: "global", auth_mode: "bearer" as const, credential_source: "environment" as const, credential_ref: "OPENAI_API_KEY", credential_available: false, capabilities: capability(true, ["Responses Structured Outputs"]), last_tested_at: NOW, last_error_code: null, created_by: "系统迁移" },
+    { id: "connection-deepseek", revision: 1, updated_at: NOW, tenant_id: "tenant-dogfood-cn", name: "DeepSeek 官方云", provider: "deepseek" as const, endpoint_scope: "public_cloud" as const, protocol: "openai_responses" as const, base_url: "https://api.deepseek.com", region: "global", auth_mode: "bearer" as const, credential_source: "none" as const, credential_ref: "DEEPSEEK_API_KEY", credential_available: false, capabilities: capability(false), last_tested_at: null, last_error_code: null, created_by: "林澈" },
+    { id: "connection-anthropic", revision: 1, updated_at: NOW, tenant_id: "tenant-dogfood-cn", name: "Anthropic 官方云", provider: "anthropic" as const, endpoint_scope: "public_cloud" as const, protocol: "anthropic_messages" as const, base_url: "https://api.anthropic.com", region: "global", auth_mode: "x-api-key" as const, credential_source: "none" as const, credential_ref: "ANTHROPIC_API_KEY", credential_available: false, capabilities: capability(false), last_tested_at: null, last_error_code: null, created_by: "林澈" },
+    { id: "connection-qwen", revision: 1, updated_at: NOW, tenant_id: "tenant-dogfood-cn", name: "Qwen 百炼中国站", provider: "qwen" as const, endpoint_scope: "public_cloud" as const, protocol: "openai_responses" as const, base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1", region: "cn-beijing", auth_mode: "bearer" as const, credential_source: "none" as const, credential_ref: "DASHSCOPE_API_KEY", credential_available: false, capabilities: capability(false), last_tested_at: null, last_error_code: null, created_by: "林澈" },
+    { id: "connection-private", revision: 1, updated_at: NOW, tenant_id: "tenant-dogfood-cn", name: "企业私有模型", provider: "custom" as const, endpoint_scope: "private" as const, protocol: "openai_chat" as const, base_url: "http://127.0.0.1:8000/v1", region: "enterprise-local", auth_mode: "none" as const, credential_source: "none" as const, credential_ref: null, credential_available: true, capabilities: capability(false, ["等待连接测试"]), last_tested_at: null, last_error_code: null, created_by: "林澈" },
+  ];
+  const profile = (id: string, name: string, connectionId: string, provider: "openai" | "deepseek" | "anthropic" | "qwen" | "custom", protocol: "openai_responses" | "openai_chat" | "anthropic_messages", scope: "public_cloud" | "private", primary: string, fallback: string | null, status: "active" | "trial_ready" | "connection_verified" | "draft") => ({
+    id, revision: status === "active" ? 2 : 1, updated_at: NOW, tenant_id: "tenant-dogfood-cn", name, connection_profile_id: connectionId, provider, protocol, endpoint_scope: scope, primary_model: primary, fallback_model: fallback, status,
+    smoke_passed_at: status === "trial_ready" || status === "active" ? NOW : null, smoke_case_count: status === "trial_ready" || status === "active" ? 14 : 0, holdout_run_id: status === "active" ? "eval-baseline-holdout" : null,
+    data_egress_acknowledged_by: status === "active" ? "周岚" : null, data_egress_acknowledged_at: status === "active" ? NOW : null, activated_by: status === "active" ? "周岚" : null, activated_at: status === "active" ? NOW : null, previous_profile_id: null, created_by: status === "active" ? "系统迁移" : "林澈",
+  });
+  const profiles = [
+    profile("model-profile-openai", "OpenAI 全局主模型", "connection-openai", "openai", "openai_responses", "public_cloud", "gpt-5.6", "gpt-5.6-terra", "active"),
+    profile("model-profile-deepseek", "DeepSeek 试用候选", "connection-deepseek", "deepseek", "openai_responses", "public_cloud", "deepseek-chat", "deepseek-reasoner", "trial_ready"),
+    profile("model-profile-anthropic", "Anthropic 连接候选", "connection-anthropic", "anthropic", "anthropic_messages", "public_cloud", "claude-sonnet-4-5-20250929", null, "draft"),
+    profile("model-profile-qwen", "Qwen 试用候选", "connection-qwen", "qwen", "openai_responses", "public_cloud", "qwen3.8-max", "qwen3.7-plus", "trial_ready"),
+    profile("model-profile-private", "企业私有模型候选", "connection-private", "custom", "openai_chat", "private", "enterprise-marketing-32b", "enterprise-marketing-14b", "connection_verified"),
+  ];
+  return { connections, profiles };
 }
 
 export function createFixtureState(): DomainState {
@@ -510,11 +552,12 @@ export function createFixtureState(): DomainState {
   const publicationHistory = makePublicationHistory();
   const quality = makeQualityFixtures(customers);
   const versions = makeAiVersions();
+  const providers = makeProviderProfiles();
   const knowledge = makeKnowledgeFixtures();
   const drafts = makeDrafts();
   const marketing = makeMarketingDecisionFixtures(customers, drafts, briefs, knowledge);
   return {
-    fixture_version: 7,
+    fixture_version: 8,
     role: "operations",
     week: 2,
     weekly_plan: {
@@ -568,6 +611,8 @@ export function createFixtureState(): DomainState {
     evaluation_decisions: quality.decisions,
     prompt_versions: versions.prompts,
     router_versions: versions.routers,
+    provider_connections: providers.connections,
+    model_profiles: providers.profiles,
     golden_cases: makeGoldenCases(),
     eval_runs: versions.evalRuns,
     knowledge_pack_versions: [knowledge.pack],
