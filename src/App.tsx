@@ -7,6 +7,7 @@ import { ProofLibrary } from "./pages/ProofLibrary";
 import { CustomerDetail, Customers } from "./pages/Customers";
 import { Execution } from "./pages/Execution";
 import { Governance } from "./pages/Governance";
+import { Insights } from "./pages/Insights";
 
 export function App() {
   return <Routes><Route element={<Shell />}>
@@ -14,6 +15,7 @@ export function App() {
     <Route path="weekly" element={<WeeklyWorkspace />} />
     <Route path="content" element={<ContentWorkspace />} />
     <Route path="proofs" element={<ProofLibrary />} />
+    <Route path="insights" element={<Insights />} />
     <Route path="customers" element={<Customers />} />
     <Route path="customers/:customerId" element={<CustomerDetail />} />
     <Route path="execution" element={<Execution />} />

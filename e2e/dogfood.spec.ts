@@ -7,7 +7,7 @@ for (const viewport of [{ width: 1440, height: 900 }, { width: 1024, height: 768
     page.on("console", (message) => { if (message.type() === "error") browserErrors.push(message.text()); });
     await page.setViewportSize(viewport);
     await page.goto("/");
-    await expect(page.getByRole("heading", { name: "本周经营台" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "内容经营台" })).toBeVisible();
     const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
     expect(overflow).toBeLessThanOrEqual(1);
     if (viewport.width === 1440) {
@@ -159,4 +159,61 @@ test("local AI key configuration keeps the secret ephemeral", async ({ page }) =
   expect(submittedKey).toBe(secret);
   expect(await page.evaluate((candidate) => Object.values(localStorage).some((value) => value.includes(candidate)), secret)).toBe(false);
   await expect(page.getByText(secret, { exact: true })).toHaveCount(0);
+});
+
+test("content operations loop reaches retrospective without automatic sending", async ({ page }) => {
+  await page.route("**/api/v2/ai/content-brief", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({
+      data: { title: "最少字段启动跟进复盘", target_segment: "销售团队", stage: "I", primary_angle: "不用重型改造也能开始", key_facts: ["统一负责人、证据和复查时间"], proof_requirements: [], cta: "回复“清单”", due_at: "2026-08-26T10:00:00+08:00", insight_refs: ["insight-09"] },
+      meta: { model: "mock-openai", response_id: "resp_e2e_brief", prompt_version: "test", generated_at: "2026-08-24T04:00:00.000Z" },
+    }) });
+  });
+  await page.goto("/insights?status=candidate");
+  const insight = page.locator(".insight-candidate").first();
+  await insight.getByRole("button", { name: "接受" }).click();
+  await page.getByRole("button", { name: "确认判断" }).click();
+  await expect(page.getByText("洞察已接受", { exact: true })).toBeVisible();
+
+  await page.goto("/insights?status=accepted");
+  await page.getByRole("button", { name: "生成 Brief" }).click();
+  await page.getByRole("button", { name: "AI 生成候选" }).click();
+  await expect(page.getByText("不用重型改造也能开始", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "人工采用 Brief" }).click();
+  await expect(page.getByText("内容 Brief 已采用", { exact: true })).toBeVisible();
+
+  await page.goto("/content?draft=draft-08");
+  await expect(page.getByText("内容 Brief · I", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "复制草稿" }).click();
+  await page.getByRole("button", { name: "标记已发布" }).click();
+  await page.getByRole("button", { name: "确认标记发布" }).click();
+  await expect(page.getByText("已标记人工发布", { exact: true })).toBeVisible();
+
+  await page.goto("/content?view=results");
+  const latestPublication = page.locator(".publication-card").first();
+  await latestPublication.getByRole("button", { name: "同步合成互动" }).click();
+  await expect(page.getByText("合成互动已同步", { exact: true })).toBeVisible();
+  await page.locator(".role-button").click();
+  await page.getByRole("menuitemradio").filter({ hasText: "销售" }).click();
+  await page.getByLabel("结果事实").fill("客户主动咨询实施清单并预约 Demo");
+  await page.getByRole("button", { name: "保存业务结果" }).click();
+  await expect(page.getByText("业务结果已回填", { exact: true })).toBeVisible();
+
+  await page.goto("/weekly");
+  await expect(page.getByRole("heading", { name: "第 4 周 内容结果" })).toBeVisible();
+  await expect(page.getByText("时间关联，不代表因果", { exact: true })).toBeVisible();
+});
+
+test("raw message access is absent for operations and audited for owned sales conversations", async ({ page }) => {
+  await page.goto("/insights");
+  await expect(page.getByRole("button", { name: /查看 conv-.* 原文/ })).toHaveCount(0);
+  await page.locator(".role-button").click();
+  await page.getByRole("menuitemradio").filter({ hasText: "销售" }).click();
+  const rawButton = page.getByRole("button", { name: /查看 conv-.* 原文/ }).first();
+  await rawButton.click();
+  await page.getByLabel("访问用途").selectOption({ label: "确认销售洞察" });
+  await page.getByRole("button", { name: "记录用途并展开" }).click();
+  await expect(page.locator(".raw-message-list")).toBeVisible();
+  await page.getByRole("button", { name: "关闭对话框" }).click();
+  await page.goto("/governance");
+  await expect(page.getByText("查看会话原文", { exact: true })).toBeVisible();
 });

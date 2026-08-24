@@ -76,4 +76,37 @@ describe("MockDataClient versioning", () => {
     expect(next.drafts.find((item) => item.id === "draft-03")).toMatchObject({ status: "blocked", approval_status: "required" });
     expect(next.proofs.find((item) => item.id === proof.id)?.referenced_by).toContain("draft-03");
   });
+
+  it("requires accepted insight lineage before adopting a Brief", async () => {
+    const client = createDataClient("mock");
+    const state = await client.getState();
+    const brief = state.content_briefs[0];
+    const rejectedInsight = state.conversation_insights.find((item) => item.status === "dismissed")!;
+    await expect(client.saveBrief({ ...brief, insight_ids: [rejectedInsight.id] }, brief.revision)).rejects.toMatchObject({ code: "INSIGHT_NOT_ACCEPTED" });
+  });
+
+  it("audits raw-message access and enforces role ownership", async () => {
+    const client = createDataClient("mock");
+    const sales = await client.setRole("sales");
+    const own = sales.archive_conversations.find((item) => item.owner === "陈牧")!;
+    const foreign = sales.archive_conversations.find((item) => item.owner !== "陈牧")!;
+    await expect(client.recordRawAccess(own.id, "")).rejects.toMatchObject({ code: "PURPOSE_REQUIRED" });
+    const accessed = await client.recordRawAccess(own.id, "确认销售洞察");
+    expect(accessed.audits[0]).toMatchObject({ action: "查看会话原文", actor: "陈牧" });
+    await expect(client.recordRawAccess(foreign.id, "确认销售洞察")).rejects.toMatchObject({ code: "RAW_ACCESS_FORBIDDEN" });
+  });
+
+  it("separates manual publication, synthetic interactions and sales outcomes", async () => {
+    const client = createDataClient("mock");
+    const state = await client.getState();
+    const draft = state.drafts.find((item) => item.status === "ready" && !item.approval_required)!;
+    const published = await client.markPublished(draft.id, draft.revision);
+    const publication = published.publications[0];
+    expect(publication).toMatchObject({ draft_id: draft.id, status: "published", likes: null });
+    const synced = await client.syncPublicationResults(publication.id, publication.revision);
+    expect(synced.publications.find((item) => item.id === publication.id)).toMatchObject({ status: "results_synced", likes: expect.any(Number) });
+    await client.setRole("sales");
+    const outcome = await client.recordContentOutcome(publication.id, "inquiry", "客户主动索要清单", null);
+    expect(outcome.content_outcomes[0]).toMatchObject({ publication_id: publication.id, type: "inquiry", recorded_by: "陈牧" });
+  });
 });

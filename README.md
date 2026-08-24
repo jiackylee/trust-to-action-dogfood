@@ -2,7 +2,7 @@
 
 面向运营、销售和负责人的内部增长副驾 Dogfood。使用 React、TypeScript、Vite、Zod、Lucide、Express 和 OpenAI Responses API，当前全部业务数据均为合成或脱敏数据。
 
-产品边界、AI 自动写入策略和验收标准见 [V2 产品方案](docs/Trust-to-Action_Dogfood产品方案_V2.md)。
+当前产品边界、内容运营闭环、隐私政策和验收标准见 [2.0 内容运营闭环产品方案](docs/Trust-to-Action_2.0内容运营闭环产品方案.md)。旧 V2 本地评审方案已移入 `docs/archive/`，不再维护。
 
 ## 本地运行
 
@@ -44,6 +44,9 @@ RUN_LIVE_OPENAI_TEST=1 npm run test:live
 - “重置演示数据”只清除此命名空间。
 - 不接真实企微、V1、`landing-page`、Firestore、Cloud Run 或 `leads`。
 - 所有发布、私聊、客服回复和 Offer 发送均由人执行。
+- 会话存档、朋友圈互动和业务结果全部为确定性合成数据：36 个会话、252 条消息、12 个洞察、8 个 Brief、8 个历史发布和 6 个业务结果。
+- 运营只查看聚类和脱敏引用；销售仅可按审计用途查看本人合成会话原文，负责人可按需查看全部。
+- 发布后结果固定按 7 天时间窗口关联，平台互动与销售业务结果分层展示，不宣称因果。
 
 ## 仓库维护
 

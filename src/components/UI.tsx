@@ -18,6 +18,7 @@ export function StatusBadge({ status }: { status: string }) {
     pending: "待处理", ready: "已就绪", review: "待检查", approved: "已批准", returned: "已退回",
     done: "已完成", blocked: "已阻断", executed: "待回填", usable: "可使用", internal_only: "仅内部",
     incomplete: "不完整", revoked: "已撤权", healthy: "正常", delayed: "延迟", partial: "部分失败", unauthorized: "未授权",
+    candidate: "待判断", accepted: "已接受", dismissed: "已忽略", adopted: "已采用", draft: "草拟中", published: "待同步", results_synced: "已同步",
   };
   return <span className={`status-dot status-${status}`}>{labels[status] ?? status}</span>;
 }

@@ -3,15 +3,21 @@ import { zodTextFormat } from "openai/helpers/zod";
 import type { z } from "zod";
 import {
   ContentDraftProposalSchema,
+  ContentBriefProposalSchema,
+  ConversationInsightsSchema,
   CustomerEvaluationSchema,
   RiskReviewSchema,
   WeeklyStrategySchema,
+  WeeklyRetrospectiveSchema,
   type AiMeta,
   type AiResult,
   type ContentDraftProposal,
+  type ContentBriefProposal,
+  type ConversationInsights,
   type CustomerEvaluation,
   type RiskReview,
   type WeeklyStrategy,
+  type WeeklyRetrospective,
 } from "../src/domain/schemas";
 
 export class AiServiceError extends Error {
@@ -32,6 +38,9 @@ export interface AiService {
   contentDraft(input: unknown): Promise<AiResult<ContentDraftProposal>>;
   riskReview(input: unknown): Promise<AiResult<RiskReview>>;
   customerEvaluation(input: unknown): Promise<AiResult<CustomerEvaluation>>;
+  conversationInsights(input: unknown): Promise<AiResult<ConversationInsights>>;
+  contentBrief(input: unknown): Promise<AiResult<ContentBriefProposal>>;
+  weeklyRetrospective(input: unknown): Promise<AiResult<WeeklyRetrospective>>;
 }
 
 export type AiConfigurationSource = "environment" | "runtime" | "none";
@@ -49,7 +58,7 @@ export interface ConfigurableAiService extends AiService {
   resetRuntimeConfiguration(): AiConfiguration;
 }
 
-const PROMPT_VERSION = "trust-to-action-v2.0.0";
+const PROMPT_VERSION = "trust-to-action-content-loop-v2.0.0";
 const SYSTEM_BOUNDARY = `你是 Trust-to-Action 内部增长副驾。只使用输入中明确提供的合成事实和证据引用。
 不得编造客户、原话、数据、授权、价格、结果或成交事实。点赞等弱信号不能独立支持 D1/A1。
 输出是结构化内部判断，不得声称已经发送、发布、报价或承诺。每条内容只保留一个 CTA。`;
@@ -122,6 +131,15 @@ export function createOpenAiService(options: { apiKey?: string; model?: string }
     customerEvaluation(input) {
       return generate(CustomerEvaluationSchema, "customer_evaluation", "根据按时间排序的有效证据判断客户状态和下一最佳动作。状态最多前进一步，C1 只能引用成交事实。", input);
     },
+    conversationInsights(input) {
+      return generate(ConversationInsightsSchema, "conversation_insights", "从已经过同意、权限、有效性和脱敏过滤的会话消息中提取问题、异议、期望结果和购买信号。每条洞察必须引用输入中的消息和会话 ID，不得还原个人信息。", input);
+    },
+    contentBrief(input) {
+      return generate(ContentBriefProposalSchema, "content_brief", "根据已接受洞察生成一份朋友圈优先的内容 Brief。固定目标客户、阶段、主角度、关键事实、证明需求、唯一 CTA 和截止时间。", input);
+    },
+    weeklyRetrospective(input) {
+      return generate(WeeklyRetrospectiveSchema, "weekly_retrospective", "分开复盘平台互动与销售业务结果，提出下周主题候选，并始终声明时间关联不代表因果。", input);
+    },
   };
 }
 
@@ -164,5 +182,8 @@ export function createOpenAiServiceManager(options: {
     contentDraft(input) { return current.contentDraft(input); },
     riskReview(input) { return current.riskReview(input); },
     customerEvaluation(input) { return current.customerEvaluation(input); },
+    conversationInsights(input) { return current.conversationInsights(input); },
+    contentBrief(input) { return current.contentBrief(input); },
+    weeklyRetrospective(input) { return current.weeklyRetrospective(input); },
   };
 }

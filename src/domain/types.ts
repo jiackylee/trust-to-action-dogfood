@@ -1,4 +1,4 @@
-import type { CustomerEvaluation, Evidence, EvidenceStrength, StateCode, WeeklyStrategy } from "./schemas";
+import type { AiMeta, CustomerEvaluation, Evidence, EvidenceStrength, StateCode, WeeklyRetrospective, WeeklyStrategy } from "./schemas";
 
 export type Role = "operations" | "sales" | "lead";
 export type Status = "pending" | "ready" | "review" | "approved" | "returned" | "done" | "blocked";
@@ -65,6 +65,9 @@ export interface DraftCore {
   status: Status;
   published_at: string | null;
   result: string | null;
+  brief_id: string | null;
+  content_family_id: string | null;
+  variant_of: string | null;
 }
 export type Draft = Versioned<DraftCore>;
 
@@ -135,6 +138,147 @@ export interface AuditEvent {
   source: "human" | "ai" | "system";
 }
 
+export interface ArchiveConsentCore {
+  customer_id: string;
+  conversation_id: string;
+  status: "agreed" | "declined" | "withdrawn";
+  scope: string;
+  agreed_at: string | null;
+  changed_at: string;
+}
+export type ArchiveConsent = Versioned<ArchiveConsentCore>;
+
+export interface ArchiveConversationCore {
+  customer_id: string;
+  owner: string;
+  kind: "direct" | "group";
+  display_name: string;
+  participant_count: number;
+  started_at: string;
+  last_message_at: string;
+  consent_id: string;
+  message_count: number;
+  latest_seq: number;
+  sync_state: "healthy" | "seq_gap" | "decrypt_partial" | "outside_recovery_window";
+}
+export type ArchiveConversation = Versioned<ArchiveConversationCore>;
+
+export interface ArchivedMessageCore {
+  conversation_id: string;
+  customer_id: string;
+  owner: string;
+  msgid: string;
+  seq: number;
+  sender: "customer" | "employee";
+  sender_name: string;
+  kind: "text" | "link" | "image" | "voice" | "video" | "file";
+  text: string | null;
+  link_description: string | null;
+  media_name: string | null;
+  sent_at: string;
+  recalled: boolean;
+  duplicate_of: string | null;
+  decrypt_status: "ok" | "failed";
+}
+export type ArchivedMessage = Versioned<ArchivedMessageCore>;
+
+export interface ConversationInsightCore {
+  batch_id: string;
+  title: string;
+  category: "问题" | "异议" | "期望结果" | "购买信号";
+  signal_type: string;
+  customer_segment: string;
+  summary: string;
+  redacted_quotes: string[];
+  message_refs: string[];
+  conversation_refs: string[];
+  distinct_conversation_count: number;
+  confidence: number;
+  evidence_strength: EvidenceStrength;
+  trend_scope: "individual" | "trend";
+  status: "candidate" | "accepted" | "dismissed";
+  decision_reason: string;
+  decided_by: string | null;
+  decided_at: string | null;
+  brief_id: string | null;
+  invalidated_reason: string | null;
+}
+export type ConversationInsight = Versioned<ConversationInsightCore>;
+
+export interface ContentBriefCore {
+  title: string;
+  insight_ids: string[];
+  target_segment: string;
+  stage: "T" | "I" | "D" | "A";
+  primary_angle: string;
+  key_facts: string[];
+  proof_requirements: string[];
+  cta: string;
+  due_at: string;
+  status: "draft" | "adopted" | "blocked";
+  adopted_by: string | null;
+  content_family_id: string | null;
+  ai_meta: AiMeta | null;
+}
+export type ContentBrief = Versioned<ContentBriefCore>;
+
+export interface ContentFamilyCore {
+  brief_id: string;
+  title: string;
+  primary_draft_id: string;
+  variant_draft_ids: string[];
+}
+export type ContentFamily = Versioned<ContentFamilyCore>;
+
+export interface PublicationRecordCore {
+  draft_id: string;
+  content_family_id: string;
+  channel: PublicationChannel;
+  operator: string;
+  published_at: string;
+  status: "published" | "results_synced";
+  association_window_days: 7;
+  visible_customers: number | null;
+  likes: number | null;
+  comments: number | null;
+  synced_at: string | null;
+}
+export type PublicationRecord = Versioned<PublicationRecordCore>;
+
+export interface ContentOutcomeCore {
+  publication_id: string;
+  customer_id: string | null;
+  type: "inquiry" | "demo" | "offer" | "state_transition";
+  detail: string;
+  occurred_at: string;
+  recorded_by: string;
+}
+export type ContentOutcome = Versioned<ContentOutcomeCore>;
+
+export interface AnalysisBatchCore {
+  seq_from: number;
+  seq_to: number;
+  started_at: string;
+  completed_at: string;
+  message_refs: string[];
+  insight_ids: string[];
+  included_count: number;
+  excluded_count: number;
+  duplicate_count: number;
+  decrypt_failure_count: number;
+  cursor_status: "complete" | "gap" | "partial";
+  model: string;
+}
+export type AnalysisBatch = Versioned<AnalysisBatchCore>;
+
+export interface WeeklyRetrospectiveRecordCore {
+  week_label: string;
+  retrospective: WeeklyRetrospective;
+  generated_by: string;
+  ai_meta: AiMeta | null;
+}
+export type WeeklyRetrospectiveRecord = Versioned<WeeklyRetrospectiveRecordCore>;
+
 export interface WeeklyPlan {
   strategy: WeeklyStrategy;
   status: "draft" | "ready";
@@ -153,6 +297,16 @@ export interface DomainState {
   approvals: Approval[];
   tasks: Task[];
   integrations: Integration[];
+  archive_consents: ArchiveConsent[];
+  archive_conversations: ArchiveConversation[];
+  archived_messages: ArchivedMessage[];
+  conversation_insights: ConversationInsight[];
+  content_briefs: ContentBrief[];
+  content_families: ContentFamily[];
+  publications: PublicationRecord[];
+  content_outcomes: ContentOutcome[];
+  analysis_batches: AnalysisBatch[];
+  weekly_retrospective: WeeklyRetrospectiveRecord;
   audits: AuditEvent[];
 }
 

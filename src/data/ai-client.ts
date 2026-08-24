@@ -1,5 +1,5 @@
-import type { AiResult, ContentDraftProposal, CustomerEvaluation, RiskReview, WeeklyStrategy } from "../domain/schemas";
-import type { Customer, Draft, Proof, Role } from "../domain/types";
+import type { AiResult, ContentBriefProposal, ContentDraftProposal, ConversationInsights, CustomerEvaluation, RiskReview, WeeklyRetrospective, WeeklyStrategy } from "../domain/schemas";
+import type { ArchiveConsent, ArchivedMessage, ContentBrief, ContentOutcome, ConversationInsight, Customer, Draft, Proof, PublicationRecord, Role } from "../domain/types";
 
 export class AiClientError extends Error {
   constructor(public code: string, message: string, public retryable: boolean, public requestId: string) {
@@ -67,7 +67,10 @@ export const aiClient = {
     return readResponse<AiConfiguration>(response);
   },
   weeklyStrategy(input: unknown) { return post<WeeklyStrategy>("weekly-strategy", input); },
-  contentDraft(strategy: WeeklyStrategy, proofs: Proof[], stage: string) { return post<ContentDraftProposal>("content-draft", { strategy, proofs, stage }); },
+  contentDraft(strategy: WeeklyStrategy, proofs: Proof[], stage: string, brief?: ContentBrief, acceptedInsights?: ConversationInsight[], historicalOutcomes?: ContentOutcome[]) { return post<ContentDraftProposal>("content-draft", { strategy, proofs, stage, brief, accepted_insights: acceptedInsights ?? [], historical_outcomes: historicalOutcomes ?? [] }); },
   riskReview(draft: Draft, proofs: Proof[]) { return post<RiskReview>("risk-review", { draft, proofs }); },
   customerEvaluation(customer: Customer) { return post<CustomerEvaluation>("customer-evaluation", { customer }); },
+  conversationInsights(messages: ArchivedMessage[], consents: ArchiveConsent[]) { return post<ConversationInsights>("conversation-insights", { messages, consents }); },
+  contentBrief(insights: ConversationInsight[], historicalOutcomes: ContentOutcome[]) { return post<ContentBriefProposal>("content-brief", { accepted_insights: insights, historical_outcomes: historicalOutcomes }); },
+  weeklyRetrospective(insights: ConversationInsight[], briefs: ContentBrief[], publications: PublicationRecord[], outcomes: ContentOutcome[]) { return post<WeeklyRetrospective>("weekly-retrospective", { insights, briefs, publications, outcomes }); },
 };

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createFixtureState } from "./fixtures";
-import { can, canAccessCustomer, canActOnTask } from "./permissions";
-import { deterministicDraftRisks, draftApprovalRisks, proofCompleteness, validateCustomerEvaluation } from "./policy";
+import { can, canAccessCustomer, canActOnTask, canViewRawConversation } from "./permissions";
+import { archiveMessageEligibility, deterministicDraftRisks, draftApprovalRisks, insightTrendScope, proofCompleteness, redactArchiveText, validateCustomerEvaluation, validateInsightLineage } from "./policy";
 
 describe("customer evaluation policy", () => {
   it("blocks a weak signal from jumping to D1", () => {
@@ -63,5 +63,53 @@ describe("deterministic gates and role permissions", () => {
     const draft = { ...state.drafts[2], channel: "官网" as const };
     expect(draftApprovalRisks(draft, state.proofs)).toContain("证明未授权用于官网");
     expect(proofCompleteness({ ...state.proofs[0], baseline: "" })).toMatchObject({ completeness: 86, missing_fields: ["基线"] });
+  });
+
+  it("enforces raw archive access by role and owner", () => {
+    expect(canViewRawConversation("operations", { owner: "陈牧" })).toBe(false);
+    expect(canViewRawConversation("sales", { owner: "陈牧" })).toBe(true);
+    expect(canViewRawConversation("sales", { owner: "许清" })).toBe(false);
+    expect(canViewRawConversation("lead", { owner: "许清" })).toBe(true);
+  });
+});
+
+describe("conversation archive privacy policy", () => {
+  it("contains the required four-week synthetic history", () => {
+    const state = createFixtureState();
+    expect(state.archive_conversations).toHaveLength(36);
+    expect(state.archived_messages.length).toBeGreaterThanOrEqual(240);
+    expect(state.conversation_insights).toHaveLength(12);
+    expect(state.content_briefs).toHaveLength(8);
+    expect(state.publications).toHaveLength(8);
+    expect(state.content_outcomes).toHaveLength(6);
+  });
+
+  it("excludes withdrawn, recalled, duplicate, decrypt-failed and media-only messages", () => {
+    const state = createFixtureState();
+    const cases = [
+      state.archived_messages.find((item) => item.conversation_id === "conv-09")!,
+      state.archived_messages.find((item) => item.recalled)!,
+      state.archived_messages.find((item) => item.duplicate_of)!,
+      state.archived_messages.find((item) => item.decrypt_status === "failed")!,
+      state.archived_messages.find((item) => item.kind === "image")!,
+    ];
+    for (const message of cases) {
+      const consent = state.archive_consents.find((item) => item.conversation_id === message.conversation_id);
+      expect(archiveMessageEligibility(message, consent).eligible).toBe(false);
+    }
+  });
+
+  it("redacts PII before analysis and applies the three-conversation trend threshold", () => {
+    expect(redactArchiveText("联系 13812345678 或 test@example.com，微信 wx:abc12345")).toBe("联系 [手机号已脱敏] 或 [邮箱已脱敏]，微信 [微信号已脱敏]");
+    expect(insightTrendScope(["a", "b"])).toBe("individual");
+    expect(insightTrendScope(["a", "b", "c"])).toBe("trend");
+  });
+
+  it("accepts only insight lineage backed by eligible timestamped messages", () => {
+    const state = createFixtureState();
+    const valid = state.conversation_insights[0];
+    expect(validateInsightLineage(valid, state.archived_messages, state.archive_consents).allowed).toBe(true);
+    const invalid = { ...valid, message_refs: [state.archived_messages.find((item) => item.recalled)!.id] };
+    expect(validateInsightLineage(invalid, state.archived_messages, state.archive_consents)).toMatchObject({ allowed: false, code: "INSIGHT_LINEAGE_BLOCKED" });
   });
 });

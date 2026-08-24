@@ -5,7 +5,8 @@ import express, { type NextFunction, type Request, type Response } from "express
 import { z } from "zod";
 import { EvidenceSchema, StateCodeSchema, WeeklyStrategySchema } from "../src/domain/schemas";
 import { validateCustomerEvaluation } from "../src/domain/policy";
-import type { Customer } from "../src/domain/types";
+import { archiveMessageEligibility } from "../src/domain/policy";
+import type { ArchiveConsent, ArchivedMessage, Customer } from "../src/domain/types";
 import { AiServiceError, type AiConfiguration, type AiService, type ConfigurableAiService } from "./ai-service";
 
 const CustomerRequestSchema = z.object({
@@ -38,11 +39,33 @@ const ContentDraftRequestSchema = z.object({
   strategy: WeeklyStrategySchema,
   proofs: z.array(z.record(z.string(), z.unknown())).max(12),
   stage: z.enum(["T", "I", "D", "A"]),
+  brief: z.record(z.string(), z.unknown()).optional(),
+  accepted_insights: z.array(z.record(z.string(), z.unknown())).max(20).default([]),
+  historical_outcomes: z.array(z.record(z.string(), z.unknown())).max(50).default([]),
 });
 
 const RiskRequestSchema = z.object({
   draft: z.record(z.string(), z.unknown()),
   proofs: z.array(z.record(z.string(), z.unknown())).max(12),
+  accepted_insights: z.array(z.record(z.string(), z.unknown())).max(20).optional(),
+  historical_outcomes: z.array(z.record(z.string(), z.unknown())).max(50).optional(),
+});
+
+const ConversationInsightsRequestSchema = z.object({
+  messages: z.array(z.record(z.string(), z.unknown())).min(1).max(1000),
+  consents: z.array(z.record(z.string(), z.unknown())).max(500),
+});
+
+const ContentBriefRequestSchema = z.object({
+  accepted_insights: z.array(z.record(z.string(), z.unknown())).min(1).max(12),
+  historical_outcomes: z.array(z.record(z.string(), z.unknown())).max(50).default([]),
+});
+
+const RetrospectiveRequestSchema = z.object({
+  insights: z.array(z.record(z.string(), z.unknown())).max(30),
+  briefs: z.array(z.record(z.string(), z.unknown())).max(20),
+  publications: z.array(z.record(z.string(), z.unknown())).max(50),
+  outcomes: z.array(z.record(z.string(), z.unknown())).max(100),
 });
 
 const StrategyRequestSchema = z.object({
@@ -163,6 +186,42 @@ export function createApp({ aiService, serveDist = false }: { aiService: AiServi
       if (!policy.allowed) throw new AiServiceError(422, policy.code, policy.reasons.join("；"), false);
       response.json(result);
     } catch (error) { next(error); }
+  });
+
+  aiRouter.post("/conversation-insights", async (request, response, next) => {
+    try {
+      const input = ConversationInsightsRequestSchema.parse(request.body);
+      const consents = input.consents as unknown as ArchiveConsent[];
+      const eligible = (input.messages as unknown as ArchivedMessage[]).flatMap((message) => {
+        const consent = consents.find((item) => item.conversation_id === message.conversation_id);
+        const policy = archiveMessageEligibility(message, consent);
+        return policy.eligible ? [{ id: message.id, conversation_id: message.conversation_id, customer_id: message.customer_id, kind: message.kind, redacted_text: policy.redacted_text, sent_at: message.sent_at }] : [];
+      });
+      if (!eligible.length) throw new AiServiceError(422, "PRIVACY_POLICY_BLOCKED", "没有通过同意、有效性与脱敏门禁的消息。", false);
+      const result = await aiService.conversationInsights({ messages: eligible, excluded_message_count: input.messages.length - eligible.length });
+      const allowedMessageIds = new Set(eligible.map((message) => message.id));
+      const allowedConversationIds = new Set(eligible.map((message) => message.conversation_id));
+      if (result.data.insights.some((insight) => insight.message_refs.some((id) => !allowedMessageIds.has(id)) || insight.conversation_refs.some((id) => !allowedConversationIds.has(id)))) {
+        throw new AiServiceError(422, "UNKNOWN_ARCHIVE_REFERENCE", "模型洞察引用了未授权或不存在的消息。", false);
+      }
+      response.json(result);
+    } catch (error) { next(error); }
+  });
+
+  aiRouter.post("/content-brief", async (request, response, next) => {
+    try {
+      const input = ContentBriefRequestSchema.parse(request.body);
+      if (input.accepted_insights.some((insight) => insight.status !== "accepted" || insight.invalidated_reason)) throw new AiServiceError(422, "INSIGHT_NOT_ACCEPTED", "内容 Brief 只能使用已接受且有效的洞察。", false);
+      const result = await aiService.contentBrief(input);
+      const allowed = new Set(input.accepted_insights.map((insight) => String(insight.id)));
+      if (result.data.insight_refs.some((id) => !allowed.has(id))) throw new AiServiceError(422, "UNKNOWN_INSIGHT_REFERENCE", "模型 Brief 引用了未知洞察。", false);
+      response.json(result);
+    } catch (error) { next(error); }
+  });
+
+  aiRouter.post("/weekly-retrospective", async (request, response, next) => {
+    try { response.json(await aiService.weeklyRetrospective(RetrospectiveRequestSchema.parse(request.body))); }
+    catch (error) { next(error); }
   });
 
   app.use("/api/v2/ai", aiRouter);

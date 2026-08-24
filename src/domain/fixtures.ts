@@ -1,4 +1,4 @@
-import type { Approval, DomainState, Draft, Integration, Proof, Task } from "./types";
+import type { AnalysisBatch, Approval, ArchiveConsent, ArchiveConversation, ArchivedMessage, ContentBrief, ContentFamily, ContentOutcome, ConversationInsight, DomainState, Draft, Integration, Proof, PublicationRecord, Task } from "./types";
 import type { Customer } from "./types";
 import { STATE_LABELS, type StateCode } from "./schemas";
 
@@ -84,6 +84,8 @@ function makeDrafts(): Draft[] {
     ["Dogfood 试点实施边界", "A", "D1 / A1 · 已确认团队规模", "推动人工诊断与试点确认", "本轮 Dogfood 先用 4 周校准状态证据和下一动作，不自动发朋友圈、不自动私聊。价格与范围在诊断后确认。", "预约范围确认", "D1 → A1", [], true, "returned", "blocked"],
     ["为什么单次点赞不能算高意向", "T", "全量线索 · 弱信号客户", "建立证据强弱的共同语言", "点赞说明看见了，不等于准备买。真正推动状态的，是主动描述问题、索要案例、提供团队规模、询问实施或排期。", "查看证据分级表", "保持 T0 / 建立 T1", [], false, "not_required", "ready"],
     ["客户说先发方案看看以后怎么办", "I", "I1 · 索要材料但信息不足", "用资格问题换取新证据", "客户说先发方案看看，不要立刻塞完整产品介绍。先问一个会改变方案的问题，例如团队规模和最常遗漏的环节。", "领取资格问题模板", "I1 → D1", [], false, "not_required", "ready"],
+    ["客户真正关心的不是线索数量", "T", "T1 · 线索较多但跟进失控", "回应高频流程异议", "会话里反复出现的不是“线索从哪里来”，而是“线索来了以后谁负责、什么时候跟、结果记在哪里”。先把这三个问题答清楚，增长才有可执行的下一步。", "回复“复盘”", "T0 → T1", [], false, "not_required", "ready"],
+    ["从一次追问识别真实购买信号", "I", "I1 · 主动询问实施方式", "帮助销售识别有效会话信号", "主动询问实施周期、团队协作和数据边界，比一次点赞更接近真实决策。把信号落到带时间的证据上，再决定是否分享 Demo。", "查看信号清单", "T1 → I1", [], false, "not_required", "ready"],
   ] as const;
   return data.map((item, index) => ({
     id: `draft-${String(index + 1).padStart(2, "0")}`,
@@ -92,6 +94,9 @@ function makeDrafts(): Draft[] {
     title: item[0], stage: item[1], segment: item[2], objective: item[3], body: item[4], cta: item[5], expected_transition: item[6],
     channel: "朋友圈",
     evidence_refs: [...item[7]], risk_flags: item[8] ? [index === 2 ? "客户证明" : "价格 / Offer"] : [], approval_required: item[8], approval_status: item[9], status: item[10], published_at: null, result: null,
+    brief_id: `brief-${String(index + 1).padStart(2, "0")}`,
+    content_family_id: `family-${String(index + 1).padStart(2, "0")}`,
+    variant_of: null,
   }));
 }
 
@@ -121,6 +126,7 @@ function makeTasks(customers: Customer[]): Task[] {
 
 function makeIntegrations(): Integration[] {
   return [
+    { id: "source-archive", revision: 2, updated_at: NOW, name: "会话内容存档（合成）", description: "seq 增量同步、单批 1000 条、SDK 解密与 5 天补拉窗口", scope: "36 个会话 · 252 条合成消息", status: "partial", last_success_at: date(23, 15), freshness: "12 分钟", cursor: "seq=1367 · gap=1124-1125", error: "1 个游标缺口、1 条解密失败；超窗消息不会补拉或进入分析。" },
     { id: "source-customers", revision: 1, updated_at: NOW, name: "企微客户与标签", description: "客户详情、负责人、标签和来源", scope: "3 名销售 · 24 位合成客户", status: "healthy", last_success_at: NOW, freshness: "8 分钟", cursor: "ext_demo_24", error: "" },
     { id: "source-moments", revision: 1, updated_at: NOW, name: "客户朋友圈", description: "记录、覆盖、评论和点赞弱信号", scope: "近 30 天 · 18 条记录", status: "delayed", last_success_at: date(23, 12), freshness: "3 小时", cursor: "mom_demo_18", error: "互动明细仍在分批同步。" },
     { id: "source-kf", revision: 1, updated_at: NOW, name: "微信客服", description: "回调触发与近 3 天消息", scope: "2 个客服账号 · 9 个会话", status: "partial", last_success_at: date(23, 14), freshness: "46 分钟", cursor: "kf_demo_09", error: "1 个会话无法关联客户。" },
@@ -128,10 +134,152 @@ function makeIntegrations(): Integration[] {
   ];
 }
 
+const ARCHIVE_NOW = new Date("2026-08-24T04:00:00.000Z");
+function archiveDate(daysAgo: number, hourOffset = 0) {
+  return new Date(ARCHIVE_NOW.getTime() - daysAgo * 24 * 60 * 60_000 + hourOffset * 60 * 60_000).toISOString();
+}
+
+function makeArchive(customers: Customer[]) {
+  const consents: ArchiveConsent[] = [];
+  const conversations: ArchiveConversation[] = [];
+  const messages: ArchivedMessage[] = [];
+  for (let index = 0; index < 36; index += 1) {
+    const number = String(index + 1).padStart(2, "0");
+    const conversationId = `conv-${number}`;
+    const customer = customers[index % customers.length];
+    const daysAgo = index < 12 ? index % 4 : 6 + (index % 22);
+    const consentStatus = [4, 15].includes(index) ? "declined" as const : index === 8 ? "withdrawn" as const : "agreed" as const;
+    consents.push({
+      id: `consent-${number}`, revision: index === 8 ? 2 : 1, updated_at: archiveDate(Math.min(daysAgo, 4)),
+      customer_id: customer.id, conversation_id: conversationId, status: consentStatus,
+      scope: "服务质量改进与内部内容洞察", agreed_at: consentStatus === "agreed" ? archiveDate(daysAgo + 2) : null,
+      changed_at: archiveDate(Math.min(daysAgo, 4)),
+    });
+    const syncState = index === 12 ? "seq_gap" as const : index === 13 ? "decrypt_partial" as const : daysAgo > 5 ? "outside_recovery_window" as const : "healthy" as const;
+    conversations.push({
+      id: conversationId, revision: 1, updated_at: archiveDate(daysAgo), customer_id: customer.id, owner: customer.owner,
+      kind: index % 5 === 0 ? "group" : "direct", display_name: index % 5 === 0 ? `${customer.company}需求讨论群` : `${customer.name}会话`,
+      participant_count: index % 5 === 0 ? 5 + (index % 4) : 2, started_at: archiveDate(Math.min(28, daysAgo + 6)),
+      last_message_at: archiveDate(daysAgo), consent_id: `consent-${number}`, message_count: 7,
+      latest_seq: 1000 + index * 10 + 7, sync_state: syncState,
+    });
+    const customerLines = [
+      "最近线索不少，但销售跟进全靠各自记忆。",
+      "我们最担心引入工具后还要维护很多字段。",
+      `团队现在有 ${5 + (index % 8)} 位销售，想先看一份实施清单。`,
+      "能否区分只是点赞和主动询问这两类信号？",
+      "如果两周能看出遗漏是否下降，我们愿意安排 Demo。",
+    ];
+    for (let messageIndex = 0; messageIndex < 7; messageIndex += 1) {
+      const messageNumber = `${number}-${messageIndex + 1}`;
+      const kind = messageIndex === 6 ? (["image", "voice", "file"] as const)[index % 3] : messageIndex === 4 ? "link" as const : "text" as const;
+      const recalled = index === 2 && messageIndex === 5;
+      const duplicateOf = index === 3 && messageIndex === 5 ? `msg-${number}-5` : null;
+      const decryptFailed = index === 13 && messageIndex === 3;
+      const isCustomer = messageIndex % 2 === 0;
+      messages.push({
+        id: `message-${messageNumber}`, revision: recalled ? 2 : 1, updated_at: archiveDate(daysAgo, -messageIndex),
+        conversation_id: conversationId, customer_id: customer.id, owner: customer.owner, msgid: duplicateOf ? `msg-${number}-5` : `msg-${messageNumber}`,
+        seq: 1000 + index * 10 + messageIndex + 1 + (index === 12 && messageIndex >= 4 ? 2 : 0),
+        sender: isCustomer ? "customer" : "employee", sender_name: isCustomer ? customer.name : customer.owner,
+        kind, text: kind === "text" ? (isCustomer ? customerLines[Math.floor(messageIndex / 2) % customerLines.length] : "已记录，我先确认当前流程和目标，再提供对应材料。") : null,
+        link_description: kind === "link" ? "客户状态证据分级与跟进复盘清单" : null,
+        media_name: ["image", "voice", "video", "file"].includes(kind) ? `合成附件-${messageNumber}.${kind === "image" ? "png" : kind === "voice" ? "amr" : "pdf"}` : null,
+        sent_at: archiveDate(daysAgo, -messageIndex), recalled, duplicate_of: duplicateOf, decrypt_status: decryptFailed ? "failed" : "ok",
+      });
+    }
+  }
+  return { consents, conversations, messages };
+}
+
+const insightTopics = [
+  ["跟进依赖个人记忆", "问题", "流程失控", "销售团队", "线索进入后缺少统一负责人、证据和复查时间。"],
+  ["担心工具增加维护负担", "异议", "实施成本", "5-15 人销售团队", "客户希望最少字段即可开始，不接受重型 CRM 改造。"],
+  ["希望先看实施清单", "购买信号", "索要方法资料", "I1 主动咨询客户", "主动索要实施清单，适合用低摩擦内容承接。"],
+  ["用两周观察遗漏下降", "期望结果", "量化验证", "D1 结果导向客户", "客户希望用短周期试点验证跟进遗漏是否下降。"],
+] as const;
+
+function makeInsights(): ConversationInsight[] {
+  const groups = [["conv-01", "conv-02", "conv-03"], ["conv-06", "conv-07", "conv-08"], ["conv-10", "conv-11", "conv-12"]];
+  return Array.from({ length: 12 }, (_, index) => {
+    const number = String(index + 1).padStart(2, "0");
+    const topic = insightTopics[index % insightTopics.length];
+    const conversationRefs = index === 11 ? ["conv-01", "conv-02"] : groups[index % groups.length];
+    const messageRefs = conversationRefs.map((conversationId) => `message-${conversationId.slice(-2)}-3`);
+    const status = index < 8 ? "accepted" as const : index < 10 ? "candidate" as const : "dismissed" as const;
+    return {
+      id: `insight-${number}`, revision: 1, updated_at: archiveDate(index % 4), batch_id: "batch-01",
+      title: topic[0], category: topic[1], signal_type: topic[2], customer_segment: topic[3], summary: topic[4],
+      redacted_quotes: ["团队规模为 [数字已泛化]，跟进仍主要依赖个人记录。", "希望先看一份不包含客户原文的实施清单。"],
+      message_refs: messageRefs, conversation_refs: conversationRefs, distinct_conversation_count: new Set(conversationRefs).size,
+      confidence: 74 + (index % 5) * 4, evidence_strength: index % 4 === 2 ? "strong" : "medium",
+      trend_scope: conversationRefs.length >= 3 ? "trend" : "individual", status,
+      decision_reason: status === "dismissed" ? "与本周目标客户不匹配。" : status === "accepted" ? "证据跨多个有效会话且可转化为内容问题。" : "",
+      decided_by: status === "candidate" ? null : "林澈", decided_at: status === "candidate" ? null : archiveDate(index % 3),
+      brief_id: index < 8 ? `brief-${number}` : null, invalidated_reason: null,
+    };
+  });
+}
+
+function makeBriefs(): ContentBrief[] {
+  return Array.from({ length: 8 }, (_, index) => {
+    const number = String(index + 1).padStart(2, "0");
+    const topic = insightTopics[index % insightTopics.length];
+    return {
+      id: `brief-${number}`, revision: 1, updated_at: archiveDate(index % 4), title: `${topic[0]}内容 Brief`, insight_ids: [`insight-${number}`],
+      target_segment: topic[3], stage: (["T", "I", "D", "A"] as const)[index % 4], primary_angle: topic[4],
+      key_facts: ["只使用已同意且有效的脱敏会话信号", "朋友圈互动属于弱信号"],
+      proof_requirements: index % 3 === 2 ? ["补充已授权的量化过程证明"] : [], cta: index % 2 ? "回复“清单”" : "预约 20 分钟诊断",
+      due_at: archiveDate(-2 + (index % 3)), status: index === 7 ? "draft" : "adopted", adopted_by: index === 7 ? null : "林澈",
+      content_family_id: `family-${number}`, ai_meta: null,
+    };
+  });
+}
+
+function makeContentFamilies(): ContentFamily[] {
+  return Array.from({ length: 8 }, (_, index) => {
+    const number = String(index + 1).padStart(2, "0");
+    return { id: `family-${number}`, revision: 1, updated_at: archiveDate(index % 4), brief_id: `brief-${number}`, title: `内容家族 ${number}`, primary_draft_id: `draft-${number}`, variant_draft_ids: [] };
+  });
+}
+
+function makePublicationHistory() {
+  const publications: PublicationRecord[] = Array.from({ length: 8 }, (_, index) => {
+    const number = String(index + 1).padStart(2, "0");
+    const synced = index < 7;
+    return {
+      id: `publication-${number}`, revision: 1, updated_at: archiveDate(2 + index * 3), draft_id: `history-draft-${number}`,
+      content_family_id: `family-${number}`, channel: "朋友圈", operator: "林澈", published_at: archiveDate(3 + index * 3),
+      status: synced ? "results_synced" : "published", association_window_days: 7,
+      visible_customers: synced ? 82 + index * 11 : null, likes: synced ? 4 + index * 2 : null, comments: synced ? index % 4 : null,
+      synced_at: synced ? archiveDate(2 + index * 3) : null,
+    };
+  });
+  const outcomes: ContentOutcome[] = Array.from({ length: 6 }, (_, index) => ({
+    id: `outcome-${String(index + 1).padStart(2, "0")}`, revision: 1, updated_at: archiveDate(1 + index * 3), publication_id: `publication-${String(index + 1).padStart(2, "0")}`,
+    customer_id: `cus-${String(index + 1).padStart(2, "0")}`, type: (["inquiry", "demo", "offer", "state_transition"] as const)[index % 4],
+    detail: ["主动咨询实施清单", "预约产品 Demo", "请求准备试点 Offer", "客户状态由 T1 进入 I1"][index % 4],
+    occurred_at: archiveDate(1 + index * 3), recorded_by: "陈牧",
+  }));
+  return { publications, outcomes };
+}
+
+function makeAnalysisBatches(insights: ConversationInsight[], messages: ArchivedMessage[]): AnalysisBatch[] {
+  return [{
+    id: "batch-01", revision: 1, updated_at: NOW, seq_from: 1001, seq_to: 1117, started_at: archiveDate(1, -1), completed_at: archiveDate(1),
+    message_refs: messages.filter((message) => message.conversation_id <= "conv-12" && message.kind === "text" && !message.recalled && !message.duplicate_of).map((message) => message.id),
+    insight_ids: insights.map((insight) => insight.id), included_count: 78, excluded_count: 6, duplicate_count: 1, decrypt_failure_count: 0, cursor_status: "complete", model: "规则基线 V0.4",
+  }];
+}
+
 export function createFixtureState(): DomainState {
   const customers = makeCustomers();
+  const archive = makeArchive(customers);
+  const conversationInsights = makeInsights();
+  const briefs = makeBriefs();
+  const publicationHistory = makePublicationHistory();
   return {
-    fixture_version: 3,
+    fixture_version: 4,
     role: "operations",
     week: 2,
     weekly_plan: {
@@ -161,6 +309,25 @@ export function createFixtureState(): DomainState {
     approvals: makeApprovals(),
     tasks: makeTasks(customers),
     integrations: makeIntegrations(),
+    archive_consents: archive.consents,
+    archive_conversations: archive.conversations,
+    archived_messages: archive.messages,
+    conversation_insights: conversationInsights,
+    content_briefs: briefs,
+    content_families: makeContentFamilies(),
+    publications: publicationHistory.publications,
+    content_outcomes: publicationHistory.outcomes,
+    analysis_batches: makeAnalysisBatches(conversationInsights, archive.messages),
+    weekly_retrospective: {
+      id: "retrospective-week-04", revision: 1, updated_at: NOW, week_label: "第 4 周", generated_by: "规则基线 V0.4", ai_meta: null,
+      retrospective: {
+        week_label: "第 4 周", summary: "流程失控和实施成本是本周最稳定的内容机会，结果层仍需更多销售回填。",
+        top_themes: [{ theme: "跟进依赖个人记忆", reason: "跨 3 个有效会话且带来 2 次业务咨询", business_results: 2 }],
+        bottlenecks: ["1 条发布记录尚未同步互动", "量化过程证明覆盖不足"],
+        next_week_candidates: [{ theme: "最少字段启动跟进复盘", objective: "降低实施成本异议", evidence_refs: ["insight-02", "insight-06"] }],
+        caveat: "时间关联，不代表因果",
+      },
+    },
     audits: [
       { id: "audit-01", actor: "系统", action: "生成周策略", detail: "主题：线索跟进不靠销售记忆", at: NOW, source: "system" },
       { id: "audit-02", actor: "林澈", action: "提交敏感审批", detail: "7 人销售团队案例", at: date(23, 11), source: "human" },
