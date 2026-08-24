@@ -104,6 +104,21 @@ async function openClient(aiService = service()) {
 }
 
 describe("AI BFF contracts", () => {
+  it("requires lead authority and explicit API usage confirmation for a live Holdout", async () => {
+    const forbidden = await call("/api/v2/ai-quality/live-holdout-runs", {
+      body: { marketing_brain_version_id: "brain-v2.2-published", router_version_id: "router-v2.1-rc1", usage_confirmed: true, idempotency_key: "live-holdout-role-contract" },
+      role: "operations",
+    });
+    expect(forbidden.status).toBe(403);
+    expect(await forbidden.json()).toMatchObject({ error: { code: "FORBIDDEN" } });
+
+    const unconfirmed = await call("/api/v2/ai-quality/live-holdout-runs", {
+      body: { marketing_brain_version_id: "brain-v2.2-published", router_version_id: "router-v2.1-rc1", usage_confirmed: false, idempotency_key: "live-holdout-confirm-contract" },
+      role: "lead",
+    });
+    expect(unconfirmed.status).toBe(400);
+  });
+
   it("returns health without exposing a key", async () => {
     const response = await call("/api/v2/health");
     expect(await response.json()).toMatchObject({ ok: true, ai_configured: true, model: "mock-openai", fast_model: "gpt-5.6-terra", data_mode: "http-sqlite", config_source: "environment", configured_at: null });

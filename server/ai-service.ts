@@ -22,6 +22,8 @@ import {
 } from "../src/domain/schemas";
 import { validateCustomerEvaluation } from "../src/domain/policy";
 import type { Customer } from "../src/domain/types";
+import type { MarketingPromptContext } from "./prompts";
+import { buildMarketingPrompt, MARKETING_PROMPT_HASHES } from "./prompts";
 
 export class AiServiceError extends Error {
   constructor(
@@ -152,18 +154,23 @@ export function createOpenAiService(options: { apiKey?: string; model?: string; 
   const fastModelAvailable = options.fastModelAvailable ?? true;
   const client = apiKey ? new OpenAI({ apiKey, timeout: 30_000, maxRetries: 0 }) : null;
 
-  async function generate<T>(schema: z.ZodType<T>, schemaName: string, task: string, input: unknown, selectedModel = model, promptVersion = PROMPT_VERSION): Promise<AiResult<T>> {
+  async function generate<T>(schema: z.ZodType<T>, schemaName: string, task: string, input: unknown, selectedModel = model, promptVersion = PROMPT_VERSION, systemPrompt = SYSTEM_BOUNDARY): Promise<AiResult<T>> {
     if (!client) throw new AiServiceError(503, "AI_NOT_CONFIGURED", "未配置 OPENAI_API_KEY，真实模型能力已阻断。", false);
+    const requestRecord = input && typeof input === "object" && !Array.isArray(input) ? input as Record<string, unknown> : null;
+    const idempotencyKey = typeof requestRecord?.__idempotency_key === "string" ? requestRecord.__idempotency_key : undefined;
+    const modelInput = requestRecord && "__idempotency_key" in requestRecord
+      ? Object.fromEntries(Object.entries(requestRecord).filter(([key]) => key !== "__idempotency_key"))
+      : input;
     const startedAt = Date.now();
     try {
       const response = await client.responses.parse({
         model: selectedModel,
         input: [
-          { role: "system", content: `${SYSTEM_BOUNDARY}\n\n当前任务：${task}` },
-          { role: "user", content: JSON.stringify(input) },
+          { role: "system", content: `${systemPrompt}\n\n当前任务：${task}` },
+          { role: "user", content: JSON.stringify(modelInput) },
         ],
         text: { format: zodTextFormat(schema, schemaName) },
-      });
+      }, idempotencyKey ? { idempotencyKey } : undefined);
       if (!response.output_parsed) {
         const refusal = JSON.stringify(response.output).includes("refusal");
         throw new AiServiceError(422, refusal ? "MODEL_REFUSAL" : "MODEL_OUTPUT_INVALID", refusal ? "模型拒绝处理当前输入。" : "模型未返回可校验的结构化结果。", false);
@@ -178,7 +185,7 @@ export function createOpenAiService(options: { apiKey?: string; model?: string; 
         latency_ms: Date.now() - startedAt,
         input_tokens: response.usage?.input_tokens ?? 0,
         output_tokens: response.usage?.output_tokens ?? 0,
-        input_fingerprint: crypto.createHash("sha256").update(JSON.stringify(input)).digest("hex").slice(0, 16),
+        input_fingerprint: crypto.createHash("sha256").update(JSON.stringify(modelInput)).digest("hex").slice(0, 16),
       };
       return { data: data.data, meta };
     } catch (error) {
@@ -191,15 +198,19 @@ export function createOpenAiService(options: { apiKey?: string; model?: string; 
     model,
     fastModel,
     weeklyStrategy(input) {
-      return generate(WeeklyStrategySchema, "weekly_strategy", "根据当前经营指标、状态分布、内容和证明资产生成一周运营策略。配比总和必须为 100。", input);
+      const context = (input as { brain_context?: MarketingPromptContext }).brain_context;
+      return generate(WeeklyStrategySchema, "weekly_strategy", "根据当前经营指标、状态分布、内容和证明资产生成一周运营策略。配比总和必须为 100。", input, model, context ? `code-${MARKETING_PROMPT_HASHES.weekly_strategy}` : PROMPT_VERSION, context ? buildMarketingPrompt("weekly_strategy", context) : SYSTEM_BOUNDARY);
     },
     contentDraft(input) {
-      return generate(ContentDraftProposalSchema, "content_draft", "生成一条可人工编辑的朋友圈草稿，引用输入中存在的证据，并明确一个 CTA。", input);
+      const context = (input as { brain_context?: MarketingPromptContext }).brain_context;
+      const selected = (input as { low_risk_rewrite?: boolean }).low_risk_rewrite && fastModelAvailable ? fastModel : model;
+      return generate(ContentDraftProposalSchema, "content_draft", "生成一条可人工编辑的朋友圈草稿，引用输入中存在的证据，并明确一个 CTA。", input, selected, context ? `code-${MARKETING_PROMPT_HASHES.content_draft}` : PROMPT_VERSION, context ? buildMarketingPrompt("content_draft", context) : SYSTEM_BOUNDARY);
     },
     riskReview(input) {
       return generate(RiskReviewSchema, "risk_review", "检查事实、客户证明、量化承诺、价格、投诉和敏感信息风险；风险判断只是建议，不能解除确定性审批门禁。", input);
     },
     async customerEvaluation(input) {
+      const context = (input as { brain_context?: MarketingPromptContext }).brain_context;
       const task = `按以下顺序完成客户评估：
 1. 仅核对按时间排序且 valid=true 的证据，逐条给出可公开的 evidence_assessment。
 2. 判断状态是否保持或最多前进一步；弱信号不能独立推动 D1/A1，C1 必须引用成交事实。
@@ -210,14 +221,15 @@ export function createOpenAiService(options: { apiKey?: string; model?: string; 
         primaryModel: model,
         fastModel,
         fastModelAvailable,
-        run: (selectedModel) => generate(CustomerEvaluationSchema, "customer_evaluation", task, input, selectedModel, CUSTOMER_PROMPT_VERSION),
+        run: (selectedModel) => generate(CustomerEvaluationSchema, "customer_evaluation", task, input, selectedModel, context ? `code-${MARKETING_PROMPT_HASHES.customer_nba}` : CUSTOMER_PROMPT_VERSION, context ? buildMarketingPrompt("customer_nba", context) : SYSTEM_BOUNDARY),
       });
     },
     conversationInsights(input) {
       return generate(ConversationInsightsSchema, "conversation_insights", "从已经过同意、权限、有效性和脱敏过滤的会话消息中提取问题、异议、期望结果和购买信号。每条洞察必须引用输入中的消息和会话 ID，不得还原个人信息。", input);
     },
     contentBrief(input) {
-      return generate(ContentBriefProposalSchema, "content_brief", "根据已接受洞察生成一份朋友圈优先的内容 Brief。固定目标客户、阶段、主角度、关键事实、证明需求、唯一 CTA 和截止时间。", input);
+      const context = (input as { brain_context?: MarketingPromptContext }).brain_context;
+      return generate(ContentBriefProposalSchema, "content_brief", "根据已接受洞察生成一份朋友圈优先的内容 Brief。固定目标客户、阶段、主角度、关键事实、证明需求、唯一 CTA 和截止时间。", input, model, context ? `code-${MARKETING_PROMPT_HASHES.content_brief}` : PROMPT_VERSION, context ? buildMarketingPrompt("content_brief", context) : SYSTEM_BOUNDARY);
     },
     weeklyRetrospective(input) {
       return generate(WeeklyRetrospectiveSchema, "weekly_retrospective", "分开复盘平台互动与销售业务结果，提出下周主题候选，并始终声明时间关联不代表因果。", input);

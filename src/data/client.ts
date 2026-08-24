@@ -2,12 +2,12 @@ import { createFixtureState } from "../domain/fixtures";
 import { sessionClient } from "./session-client";
 import { actorForRole, can, canAccessCustomer, canActOnTask, canViewRawConversation } from "../domain/permissions";
 import { draftApprovalRisks, insightTrendScope, isMaterialDraftChange, proofCompleteness, proofIsUsable, validateCustomerEvaluation, validateInsightLineage } from "../domain/policy";
-import { candidateIsStale, evidenceFingerprint, scoreSyntheticGoldenSet } from "../domain/quality";
+import { candidateIsStale, evidenceFingerprint, scoreGoldenReplay } from "../domain/quality";
 import type { AiMeta, CustomerEvaluation, WeeklyRetrospective } from "../domain/schemas";
-import type { AnalysisBatch, ApiProblem, Approval, ContentBrief, ContentOutcome, ConversationInsight, DomainState, Draft, EvalRun, EvaluationCandidate, EvaluationDecision, EvaluationDecisionKind, EvaluationReasonCode, EvaluationReviewOutcome, GenerationRun, NbaDecision, Proof, ProofCore, PublicationRecord, Role, Task } from "../domain/types";
+import type { AnalysisBatch, ApiProblem, Approval, ContentBrief, ContentOutcome, ConversationInsight, DomainState, Draft, EvalRun, EvaluationCandidate, EvaluationDecision, EvaluationDecisionKind, EvaluationReasonCode, EvaluationReviewOutcome, GenerationRun, KnowledgePackVersion, KnowledgeRetrievalRun, KnowledgeSource, MarketingDecisionCandidate, MarketingDecisionDecision, MarketingDecisionKind, MarketingDecisionOutput, MarketingDecisionReasonCode, MarketingReviewOutcome, MarketingTaskType, NbaDecision, Proof, ProofCore, PublicationRecord, Role, Task } from "../domain/types";
 
-const STORAGE_KEY = "trust-to-action-dogfood-v2-1";
-const FIXTURE_VERSION = 5;
+const STORAGE_KEY = "trust-to-action-dogfood-v2-2";
+const FIXTURE_VERSION = 7;
 
 export type NewProof = Omit<ProofCore, "completeness" | "missing_fields" | "referenced_by">;
 
@@ -20,11 +20,15 @@ export interface DataClient {
   createProof(proof: NewProof): Promise<DomainState>;
   decideEvaluationCandidate(customerId: string, candidateId: string, decision: EvaluationDecisionKind, evaluation: CustomerEvaluation | null, reasonCode: EvaluationReasonCode | null, reasonNote: string, expectedRevision: number): Promise<DomainState>;
   recordEvaluationReview(decisionId: string, outcome: EvaluationReviewOutcome, reason: string, expectedRevision: number): Promise<DomainState>;
-  runGoldenEvaluation(promptVersionId: string, routerVersionId: string, split: "development" | "holdout"): Promise<DomainState>;
-  createPromptVersion(name: string, description: string): Promise<DomainState>;
+  saveMarketingCandidate(candidate: MarketingDecisionCandidate): Promise<DomainState>;
+  decideMarketingCandidate(candidateId: string, decision: MarketingDecisionKind, output: MarketingDecisionOutput | null, reasonCode: MarketingDecisionReasonCode | null, reasonNote: string, expectedRevision: number): Promise<DomainState>;
+  recordMarketingReview(decisionId: string, outcome: MarketingReviewOutcome, reason: string, expectedRevision: number): Promise<DomainState>;
+  runGoldenEvaluation(marketingBrainVersionId: string, routerVersionId: string, split: "development" | "holdout"): Promise<DomainState>;
+  startLiveHoldout(marketingBrainVersionId: string, routerVersionId: string, idempotencyKey: string): Promise<DomainState>;
+  pauseLiveHoldout(runId: string, expectedRevision: number): Promise<DomainState>;
   createRouterVersion(name: string, description: string, confidenceThreshold: number): Promise<DomainState>;
-  promoteAiVersion(kind: "prompt" | "router", versionId: string, expectedRevision: number): Promise<DomainState>;
-  rollbackAiVersion(kind: "prompt" | "router", versionId: string, expectedRevision: number): Promise<DomainState>;
+  promoteAiVersion(kind: "brain" | "router", versionId: string, expectedRevision: number): Promise<DomainState>;
+  rollbackAiVersion(kind: "brain" | "router", versionId: string, expectedRevision: number): Promise<DomainState>;
   decideNba(customerId: string, decision: NbaDecision["decision"], action: string, reason: string, expectedRevision: number): Promise<DomainState>;
   addCustomerNote(customerId: string, text: string, expectedRevision: number): Promise<DomainState>;
   decideApproval(id: string, decision: "approved" | "returned", reason: string, expectedRevision: number): Promise<DomainState>;
@@ -48,6 +52,14 @@ function problem(status: number, code: string, message: string, retryable = fals
 
 function now() { return new Date().toISOString(); }
 function id(prefix: string) { return `${prefix}-${crypto.randomUUID()}`; }
+
+function samePromptHashes(left: Record<MarketingTaskType, string>, right: Record<MarketingTaskType, string>) {
+  return (["weekly_strategy", "content_brief", "content_draft", "customer_nba"] as MarketingTaskType[]).every((task) => left[task] === right[task]);
+}
+
+function sameBrainBinding(left: DomainState["marketing_brain_versions"][number], knowledgePackId: string, promptHashes: Record<MarketingTaskType, string>) {
+  return left.knowledge_pack_version_id === knowledgePackId && samePromptHashes(left.prompt_hashes, promptHashes);
+}
 
 function recalculateProofReferences(proofs: Proof[], drafts: Draft[]) {
   return proofs.map((proof) => ({ ...proof, referenced_by: drafts.filter((draft) => draft.evidence_refs.includes(proof.id)).map((draft) => draft.id) }));
@@ -95,6 +107,36 @@ export class StateDataClient implements DataClient {
   async #latency() { await this.#wait(); }
   async getState() { await this.#latency(); return structuredClone(this.#state); }
   async setRole(role: Role) { await this.#latency(); return this.#persist({ ...this.#state, role }); }
+
+  async syncKnowledgeCatalog(versions: KnowledgePackVersion[], sources: KnowledgeSource[], retrievalRuns: KnowledgeRetrievalRun[], promptHashes?: Record<MarketingTaskType, string>) {
+    await this.#latency();
+    const nextActive = versions.find((item) => item.status === "active");
+    const publishedBrain = this.#state.marketing_brain_versions.find((item) => item.status === "published");
+    const desiredHashes = promptHashes ?? publishedBrain?.prompt_hashes;
+    const bindingChanged = Boolean(nextActive && publishedBrain && desiredHashes && !sameBrainBinding(publishedBrain, nextActive.id, desiredHashes));
+    const nowValue = now();
+    let brains = this.#state.marketing_brain_versions;
+    if (bindingChanged && nextActive && publishedBrain && desiredHashes && !brains.some((item) => item.status === "draft" && sameBrainBinding(item, nextActive.id, desiredHashes))) {
+      const suffix = `${nextActive.id}-${Object.values(desiredHashes).join("")}`.replace(/[^a-zA-Z0-9]/gu, "").slice(-18);
+      brains = [...brains, {
+        ...publishedBrain,
+        id: `brain-candidate-${suffix}`,
+        revision: 1,
+        updated_at: nowValue,
+        name: `营销大脑 2.2 · ${nextActive.name}`,
+        status: "draft",
+        prompt_hashes: desiredHashes,
+        knowledge_pack_version_id: nextActive.id,
+        created_by: actorForRole(this.#state.role),
+        published_by: null,
+        published_at: null,
+      }];
+    }
+    const candidates = this.#state.marketing_candidates.map((item): MarketingDecisionCandidate => item.status === "pending" && bindingChanged
+      ? { ...item, status: "stale", revision: item.revision + 1, updated_at: nowValue }
+      : item);
+    return this.#persist({ ...this.#state, knowledge_pack_versions: versions, knowledge_sources: sources, knowledge_retrieval_runs: retrievalRuns, marketing_brain_versions: brains, marketing_candidates: candidates });
+  }
 
   async saveDraft(draft: Draft, expectedRevision: number) {
     await this.#latency();
@@ -267,32 +309,111 @@ export class StateDataClient implements DataClient {
     return this.#persist({ ...this.#state, evaluation_decisions: this.#state.evaluation_decisions.map((item) => item.id === decision.id ? updated : item), audits: [audit, ...this.#state.audits] });
   }
 
-  async runGoldenEvaluation(promptVersionId: string, routerVersionId: string, split: "development" | "holdout") {
+  async saveMarketingCandidate(candidate: MarketingDecisionCandidate) {
+    await this.#latency();
+    const required = candidate.task_type === "customer_nba" ? "evaluate_customer" : candidate.task_type === "weekly_strategy" ? "generate_strategy" : candidate.task_type === "content_brief" ? "manage_brief" : "edit_draft";
+    if (!can(this.#state.role, required)) throw problem(403, "FORBIDDEN", "当前角色不能生成该营销决策候选");
+    const activeBrain = this.#state.marketing_brain_versions.find((item) => item.status === "published");
+    const activeFacts = this.#state.tenant_fact_versions.find((item) => item.status === "published");
+    if (!activeBrain || !activeFacts) throw problem(422, "MARKETING_BRAIN_NOT_PUBLISHED", "营销脑或企业事实版本尚未发布");
+    if (candidate.envelope.marketing_brain_version !== activeBrain.id || candidate.envelope.tenant_fact_version !== activeFacts.id) throw problem(409, "STALE_MARKETING_BRAIN_BINDING", "营销脑或企业事实版本已变化，候选未保存", true);
+    const savedAt = now();
+    const previous = this.#state.marketing_candidates.map((item): MarketingDecisionCandidate => item.task_type === candidate.task_type && item.subject_id === candidate.subject_id && item.status === "pending"
+      ? { ...item, status: "stale", revision: item.revision + 1, updated_at: savedAt }
+      : item);
+    const audit = { id: id("audit"), actor: "OpenAI", action: "生成营销决策候选", detail: `${candidate.task_type} · ${candidate.subject_id} · ${candidate.envelope.knowledge_refs.length} 条知识引用`, at: savedAt, source: "ai" as const };
+    return this.#persist({ ...this.#state, marketing_candidates: [candidate, ...previous], audits: [audit, ...this.#state.audits] });
+  }
+
+  async decideMarketingCandidate(candidateId: string, decision: MarketingDecisionKind, output: MarketingDecisionOutput | null, reasonCode: MarketingDecisionReasonCode | null, reasonNote: string, expectedRevision: number) {
+    await this.#latency();
+    if (!can(this.#state.role, "review_marketing_output")) throw problem(403, "FORBIDDEN", "当前角色不能审阅营销决策候选");
+    const candidate = this.#state.marketing_candidates.find((item) => item.id === candidateId);
+    if (!candidate) throw problem(404, "MARKETING_CANDIDATE_NOT_FOUND", "营销决策候选不存在");
+    if (candidate.status !== "pending") throw problem(409, "CANDIDATE_ALREADY_DECIDED", "该候选已处理", false, candidate);
+    const customerTask = candidate.task_type === "customer_nba";
+    if ((customerTask && this.#state.role !== "sales") || (!customerTask && this.#state.role !== "operations")) throw problem(403, "FORBIDDEN", customerTask ? "只有负责销售可以审阅客户 NBA" : "只有运营可以审阅内容与策略候选");
+    const activeBrain = this.#state.marketing_brain_versions.find((item) => item.status === "published");
+    const activeFacts = this.#state.tenant_fact_versions.find((item) => item.status === "published");
+    const activeKnowledge = this.#state.knowledge_pack_versions.find((item) => item.status === "active");
+    if (!activeBrain || !activeFacts || !activeKnowledge || candidate.envelope.marketing_brain_version !== activeBrain.id || candidate.envelope.tenant_fact_version !== activeFacts.id || candidate.envelope.knowledge_pack_version !== activeKnowledge.id) throw problem(409, "STALE_MARKETING_CANDIDATE", "知识、事实或营销脑版本已变化，请重新生成候选", true);
+    const subject = candidate.task_type === "customer_nba" ? this.#state.customers.find((item) => item.id === candidate.subject_id)
+      : candidate.task_type === "content_brief" ? this.#state.content_briefs.find((item) => item.id === candidate.subject_id)
+        : candidate.task_type === "content_draft" ? this.#state.drafts.find((item) => item.id === candidate.subject_id) : null;
+    if (subject && (subject.revision !== expectedRevision || subject.revision !== candidate.subject_revision)) throw problem(409, "STALE_MARKETING_CANDIDATE", "业务对象已变化，请重新生成候选", true, subject);
+    if (decision !== "accepted" && !reasonCode) throw problem(422, "REASON_REQUIRED", "修改或拒绝候选时必须选择原因");
+    if (decision !== "accepted" && !reasonNote.trim()) throw problem(422, "REASON_NOTE_REQUIRED", "修改或拒绝候选时必须说明原因");
+    const finalOutput = decision === "accepted" ? candidate.envelope.output : decision === "modified" ? output : null;
+    if (decision === "modified" && !finalOutput) throw problem(422, "OUTPUT_REQUIRED", "修改后采用必须提供完整输出");
+
+    let customers = this.#state.customers;
+    let drafts = this.#state.drafts;
+    let briefs = this.#state.content_briefs;
+    let weeklyPlan = this.#state.weekly_plan;
+    const decidedAt = now();
+    if (finalOutput && candidate.task_type === "customer_nba") {
+      const customer = subject as DomainState["customers"][number];
+      const evaluation = finalOutput as CustomerEvaluation;
+      if (!canAccessCustomer(this.#state.role, customer)) throw problem(404, "NOT_FOUND", "客户不在当前销售可见范围");
+      const policy = validateCustomerEvaluation(customer, evaluation);
+      if (!policy.allowed) throw problem(422, policy.code, policy.reasons.join("；"));
+      customers = customers.map((item) => item.id === customer.id ? { ...item, state: evaluation.state_after, confidence: evaluation.confidence, review_at: evaluation.next_review_at, evaluation, evaluation_meta: { model: candidate.envelope.ai_meta.model, response_id: candidate.envelope.ai_meta.response_id, prompt_version: candidate.envelope.ai_meta.prompt_version }, revision: item.revision + 1, updated_at: decidedAt } : item);
+    } else if (finalOutput && candidate.task_type === "weekly_strategy") {
+      const strategy = finalOutput as DomainState["weekly_plan"]["strategy"];
+      if (Object.values(strategy.ratio).reduce((sum, value) => sum + value, 0) !== 100) throw problem(422, "POLICY_BLOCKED", "T/I/D/A 配比总和必须为 100");
+      weeklyPlan = { strategy, status: "ready", generated_by: actorForRole(this.#state.role), generated_at: decidedAt };
+    } else if (finalOutput && candidate.task_type === "content_brief") {
+      const proposal = finalOutput as import("../domain/schemas").ContentBriefProposal;
+      briefs = briefs.map((item) => item.id === candidate.subject_id ? { ...item, title: proposal.title, target_segment: proposal.target_segment, stage: proposal.stage, primary_angle: proposal.primary_angle, key_facts: proposal.key_facts, proof_requirements: proposal.proof_requirements, cta: proposal.cta, due_at: proposal.due_at, insight_ids: proposal.insight_refs, status: "adopted", adopted_by: actorForRole(this.#state.role), ai_meta: candidate.envelope.ai_meta, revision: item.revision + 1, updated_at: decidedAt } : item);
+    } else if (finalOutput && candidate.task_type === "content_draft") {
+      const proposal = finalOutput as import("../domain/schemas").ContentDraftProposal;
+      const current = subject as Draft;
+      const next = { ...current, title: proposal.title, stage: proposal.stage, segment: proposal.target_segment, objective: proposal.objective, body: proposal.body, cta: proposal.cta, expected_transition: proposal.expected_transition, evidence_refs: proposal.evidence_refs, risk_flags: proposal.risk_flags, approval_required: proposal.approval_required, approval_status: proposal.approval_required ? "required" as const : "not_required" as const, status: proposal.approval_required ? "review" as const : "ready" as const, revision: current.revision + 1, updated_at: decidedAt };
+      drafts = drafts.map((item) => item.id === current.id ? next : item);
+    }
+    const decisionId = id("marketing-decision");
+    const record: MarketingDecisionDecision = { id: decisionId, revision: 1, updated_at: decidedAt, candidate_id: candidate.id, task_type: candidate.task_type, subject_id: candidate.subject_id, decision, original_output: candidate.envelope.output, final_output: finalOutput, reason_code: decision === "accepted" ? null : reasonCode, reason_note: reasonNote.trim(), actor: actorForRole(this.#state.role), decided_at: decidedAt, reviewed_within_48h: new Date(decidedAt).getTime() - new Date(candidate.created_at).getTime() <= 48 * 60 * 60_000, review_outcome: null, review_reason: "", reviewed_at: null };
+    const updatedCandidate: MarketingDecisionCandidate = { ...candidate, status: decision, decided_at: decidedAt, decision_id: decisionId, revision: candidate.revision + 1, updated_at: decidedAt };
+    const audit = { id: id("audit"), actor: record.actor, action: decision === "accepted" ? "原样采用营销决策" : decision === "modified" ? "修改后采用营销决策" : "拒绝营销决策", detail: `${candidate.task_type} · ${candidate.subject_id}${reasonCode ? ` · ${reasonCode}` : ""}`, at: decidedAt, source: "human" as const };
+    return this.#persist({ ...this.#state, customers, drafts, content_briefs: briefs, weekly_plan: weeklyPlan, marketing_candidates: this.#state.marketing_candidates.map((item) => item.id === candidate.id ? updatedCandidate : item), marketing_decisions: [record, ...this.#state.marketing_decisions], audits: [audit, ...this.#state.audits] });
+  }
+
+  async recordMarketingReview(decisionId: string, outcome: MarketingReviewOutcome, reason: string, expectedRevision: number) {
+    await this.#latency();
+    const decision = this.#state.marketing_decisions.find((item) => item.id === decisionId);
+    if (!decision) throw problem(404, "DECISION_NOT_FOUND", "营销决策不存在");
+    const expectedRole = decision.task_type === "customer_nba" ? "sales" : "operations";
+    if (this.#state.role !== expectedRole || decision.actor !== actorForRole(this.#state.role)) throw problem(403, "FORBIDDEN", "只能复查本人已采用的营销决策");
+    if (decision.revision !== expectedRevision) throw problem(409, "VERSION_CONFLICT", "复查记录已更新", true, decision);
+    if (outcome !== "retained" && !reason.trim()) throw problem(422, "REVIEW_REASON_REQUIRED", "质量撤销或新增证据必须说明原因");
+    const reviewedAt = now();
+    const updated: MarketingDecisionDecision = { ...decision, review_outcome: outcome, review_reason: reason.trim(), reviewed_at: reviewedAt, revision: decision.revision + 1, updated_at: reviewedAt };
+    return this.#persist({ ...this.#state, marketing_decisions: this.#state.marketing_decisions.map((item) => item.id === decision.id ? updated : item), audits: [{ id: id("audit"), actor: decision.actor, action: "营销决策 7 天复查", detail: `${decision.task_type} · ${outcome}${reason ? ` · ${reason}` : ""}`, at: reviewedAt, source: "human" }, ...this.#state.audits] });
+  }
+
+  async runGoldenEvaluation(marketingBrainVersionId: string, routerVersionId: string, split: "development" | "holdout") {
     await this.#latency();
     if (!can(this.#state.role, "manage_ai_quality")) throw problem(403, "FORBIDDEN", "只有运营可以运行黄金集评测");
-    const prompt = this.#state.prompt_versions.find((item) => item.id === promptVersionId);
+    const brain = this.#state.marketing_brain_versions.find((item) => item.id === marketingBrainVersionId);
     const router = this.#state.router_versions.find((item) => item.id === routerVersionId);
-    if (!prompt || !router) throw problem(404, "AI_VERSION_NOT_FOUND", "Prompt 或路由版本不存在");
+    if (!brain || !router) throw problem(404, "AI_VERSION_NOT_FOUND", "营销脑或路由版本不存在");
     const cases = this.#state.golden_cases.filter((item) => item.split === split);
-    const candidateVersion = prompt.name.includes("v2.1") || router.name.includes("v2.1");
+    const candidateVersion = !brain.name.includes("2.1") || !router.name.includes("v2.0");
     const startedAt = now();
     const run: EvalRun = {
-      id: id("eval"), revision: 1, updated_at: startedAt, prompt_version_id: prompt.id, router_version_id: router.id, split, status: "completed",
-      case_count: cases.length, score: scoreSyntheticGoldenSet(cases, candidateVersion), started_at: startedAt, completed_at: startedAt, generated_by: actorForRole(this.#state.role),
+      id: id("eval"), revision: 1, updated_at: startedAt, marketing_brain_version_id: brain.id, router_version_id: router.id, split, mode: "replay", status: "completed",
+      case_count: cases.length, score: scoreGoldenReplay(cases, candidateVersion), started_at: startedAt, completed_at: startedAt, generated_by: actorForRole(this.#state.role),
     };
-    const audit = { id: id("audit"), actor: actorForRole(this.#state.role), action: "运行 AI 黄金集评测", detail: `${prompt.name} · ${router.name} · ${split} ${cases.length} 条 · ${run.score?.passed ? "通过" : "未通过"}`, at: startedAt, source: "system" as const };
+    const audit = { id: id("audit"), actor: actorForRole(this.#state.role), action: "运行 AI 黄金集评测", detail: `${brain.name} · ${router.name} · ${split} ${cases.length} 条 · ${run.score?.passed ? "通过" : "未通过"}`, at: startedAt, source: "system" as const };
     return this.#persist({ ...this.#state, eval_runs: [...this.#state.eval_runs, run], audits: [audit, ...this.#state.audits] });
   }
 
-  async createPromptVersion(name: string, description: string) {
-    await this.#latency();
-    if (!can(this.#state.role, "manage_ai_quality")) throw problem(403, "FORBIDDEN", "只有运营可以创建 Prompt 候选");
-    if (!name.trim() || !description.trim()) throw problem(422, "VERSION_FIELDS_REQUIRED", "版本名称和变更说明不能为空");
-    if (this.#state.prompt_versions.some((item) => item.name === name.trim())) throw problem(409, "VERSION_NAME_EXISTS", "Prompt 版本名称已存在");
-    const createdAt = now();
-    const version = { id: id("prompt"), revision: 1, updated_at: createdAt, name: name.trim(), task: "customer_evaluation" as const, status: "draft" as const, description: description.trim(), created_by: actorForRole(this.#state.role), published_by: null, published_at: null };
-    const audit = { id: id("audit"), actor: actorForRole(this.#state.role), action: "创建 Prompt 候选", detail: `${version.name} · ${version.description}`, at: createdAt, source: "human" as const };
-    return this.#persist({ ...this.#state, prompt_versions: [...this.#state.prompt_versions, version], audits: [audit, ...this.#state.audits] });
+  async startLiveHoldout(_marketingBrainVersionId: string, _routerVersionId: string, _idempotencyKey: string): Promise<DomainState> {
+    throw problem(501, "LIVE_EVAL_HTTP_REQUIRED", "真实 Holdout 只在 HTTP + SQLite 模式下可用");
+  }
+
+  async pauseLiveHoldout(_runId: string, _expectedRevision: number): Promise<DomainState> {
+    throw problem(501, "LIVE_EVAL_HTTP_REQUIRED", "真实 Holdout 只在 HTTP + SQLite 模式下可用");
   }
 
   async createRouterVersion(name: string, description: string, confidenceThreshold: number) {
@@ -307,28 +428,29 @@ export class StateDataClient implements DataClient {
     return this.#persist({ ...this.#state, router_versions: [...this.#state.router_versions, version], audits: [audit, ...this.#state.audits] });
   }
 
-  async promoteAiVersion(kind: "prompt" | "router", versionId: string, expectedRevision: number) {
+  async promoteAiVersion(kind: "brain" | "router", versionId: string, expectedRevision: number) {
     await this.#latency();
     if (!can(this.#state.role, "publish_ai_version")) throw problem(403, "FORBIDDEN", "只有负责人可以发布 AI 版本");
-    const versions = kind === "prompt" ? this.#state.prompt_versions : this.#state.router_versions;
+    const versions = kind === "brain" ? this.#state.marketing_brain_versions : this.#state.router_versions;
     const version = versions.find((item) => item.id === versionId);
     if (!version) throw problem(404, "AI_VERSION_NOT_FOUND", "AI 版本不存在");
     if (version.revision !== expectedRevision) throw problem(409, "VERSION_CONFLICT", "AI 版本已更新", true, version);
     if (version.status !== "draft") throw problem(409, "VERSION_NOT_DRAFT", "只有候选版本可以发布", false, version);
-    const qualifyingRun = [...this.#state.eval_runs].reverse().find((item) => item.split === "holdout" && item.status === "completed" && item.score?.passed && (kind === "prompt" ? item.prompt_version_id === version.id : item.router_version_id === version.id));
+    const qualifyingRun = [...this.#state.eval_runs].reverse().find((item) => item.split === "holdout" && item.status === "completed" && item.score?.passed && (kind === "brain" ? item.marketing_brain_version_id === version.id : item.router_version_id === version.id));
     if (!qualifyingRun) throw problem(422, "QUALITY_GATE_BLOCKED", "锁定 Holdout 尚未通过全部发布门槛");
     const publishedAt = now();
     const promoted = versions.map((item) => item.id === version.id
       ? { ...item, status: "published" as const, published_by: actorForRole(this.#state.role), published_at: publishedAt, revision: item.revision + 1, updated_at: publishedAt }
       : item.status === "published" ? { ...item, status: "archived" as const, revision: item.revision + 1, updated_at: publishedAt } : item);
-    const audit = { id: id("audit"), actor: actorForRole(this.#state.role), action: kind === "prompt" ? "发布 Prompt 版本" : "发布路由版本", detail: `${version.name} · Holdout ${qualifyingRun.score?.first_draft_adoption}% 首稿采用`, at: publishedAt, source: "human" as const };
-    return this.#persist({ ...this.#state, prompt_versions: kind === "prompt" ? promoted as DomainState["prompt_versions"] : this.#state.prompt_versions, router_versions: kind === "router" ? promoted as DomainState["router_versions"] : this.#state.router_versions, audits: [audit, ...this.#state.audits] });
+    const audit = { id: id("audit"), actor: actorForRole(this.#state.role), action: kind === "brain" ? "发布营销脑版本" : "发布路由版本", detail: `${version.name} · Holdout ${qualifyingRun.score?.macro_adoption_rate}% 决策有效采用`, at: publishedAt, source: "human" as const };
+    const candidates = kind === "brain" ? this.#state.marketing_candidates.map((item): MarketingDecisionCandidate => item.status === "pending" ? { ...item, status: "stale", revision: item.revision + 1, updated_at: publishedAt } : item) : this.#state.marketing_candidates;
+    return this.#persist({ ...this.#state, marketing_brain_versions: kind === "brain" ? promoted as DomainState["marketing_brain_versions"] : this.#state.marketing_brain_versions, router_versions: kind === "router" ? promoted as DomainState["router_versions"] : this.#state.router_versions, marketing_candidates: candidates, audits: [audit, ...this.#state.audits] });
   }
 
-  async rollbackAiVersion(kind: "prompt" | "router", versionId: string, expectedRevision: number) {
+  async rollbackAiVersion(kind: "brain" | "router", versionId: string, expectedRevision: number) {
     await this.#latency();
     if (!can(this.#state.role, "publish_ai_version")) throw problem(403, "FORBIDDEN", "只有负责人可以回滚 AI 版本");
-    const versions = kind === "prompt" ? this.#state.prompt_versions : this.#state.router_versions;
+    const versions = kind === "brain" ? this.#state.marketing_brain_versions : this.#state.router_versions;
     const version = versions.find((item) => item.id === versionId);
     if (!version) throw problem(404, "AI_VERSION_NOT_FOUND", "AI 版本不存在");
     if (version.revision !== expectedRevision) throw problem(409, "VERSION_CONFLICT", "AI 版本已更新", true, version);
@@ -337,8 +459,9 @@ export class StateDataClient implements DataClient {
     const rolledBack = versions.map((item) => item.id === version.id
       ? { ...item, status: "published" as const, published_by: actorForRole(this.#state.role), published_at: rolledBackAt, revision: item.revision + 1, updated_at: rolledBackAt }
       : item.status === "published" ? { ...item, status: "archived" as const, revision: item.revision + 1, updated_at: rolledBackAt } : item);
-    const audit = { id: id("audit"), actor: actorForRole(this.#state.role), action: kind === "prompt" ? "回滚 Prompt 版本" : "回滚路由版本", detail: `${version.name} · 恢复上一已验证版本`, at: rolledBackAt, source: "human" as const };
-    return this.#persist({ ...this.#state, prompt_versions: kind === "prompt" ? rolledBack as DomainState["prompt_versions"] : this.#state.prompt_versions, router_versions: kind === "router" ? rolledBack as DomainState["router_versions"] : this.#state.router_versions, audits: [audit, ...this.#state.audits] });
+    const audit = { id: id("audit"), actor: actorForRole(this.#state.role), action: kind === "brain" ? "回滚营销脑版本" : "回滚路由版本", detail: `${version.name} · 恢复上一已验证版本`, at: rolledBackAt, source: "human" as const };
+    const candidates = kind === "brain" ? this.#state.marketing_candidates.map((item): MarketingDecisionCandidate => item.status === "pending" ? { ...item, status: "stale", revision: item.revision + 1, updated_at: rolledBackAt } : item) : this.#state.marketing_candidates;
+    return this.#persist({ ...this.#state, marketing_brain_versions: kind === "brain" ? rolledBack as DomainState["marketing_brain_versions"] : this.#state.marketing_brain_versions, router_versions: kind === "router" ? rolledBack as DomainState["router_versions"] : this.#state.router_versions, marketing_candidates: candidates, audits: [audit, ...this.#state.audits] });
   }
 
   async decideNba(customerId: string, decision: NbaDecision["decision"], action: string, reason: string, expectedRevision: number) {
@@ -569,11 +692,15 @@ class HttpDataClient implements DataClient {
   createProof(proof: NewProof) { return this.#request("/proofs", { method: "POST", body: JSON.stringify({ proof }) }); }
   decideEvaluationCandidate(customerId: string, candidateId: string, decision: EvaluationDecisionKind, evaluation: CustomerEvaluation | null, reasonCode: EvaluationReasonCode | null, reasonNote: string, expectedRevision: number) { return this.#request(`/customers/${customerId}/evaluation-decisions`, { method: "POST", body: JSON.stringify({ candidate_id: candidateId, decision, evaluation, reason_code: reasonCode, reason_note: reasonNote, expected_revision: expectedRevision }) }); }
   recordEvaluationReview(decisionId: string, outcome: EvaluationReviewOutcome, reason: string, expectedRevision: number) { return this.#request(`/evaluation-decisions/${decisionId}/review`, { method: "POST", body: JSON.stringify({ outcome, reason, expected_revision: expectedRevision }) }); }
-  runGoldenEvaluation(promptVersionId: string, routerVersionId: string, split: "development" | "holdout") { return this.#request("/ai-quality/eval-runs", { method: "POST", body: JSON.stringify({ prompt_version_id: promptVersionId, router_version_id: routerVersionId, split }) }); }
-  createPromptVersion(name: string, description: string) { return this.#request("/ai-quality/prompt-versions", { method: "POST", body: JSON.stringify({ name, description }) }); }
+  saveMarketingCandidate(candidate: MarketingDecisionCandidate) { return this.#request("/marketing/candidates", { method: "POST", body: JSON.stringify({ candidate }) }); }
+  decideMarketingCandidate(candidateId: string, decision: MarketingDecisionKind, output: MarketingDecisionOutput | null, reasonCode: MarketingDecisionReasonCode | null, reasonNote: string, expectedRevision: number) { return this.#request(`/marketing/candidates/${candidateId}/decision`, { method: "POST", body: JSON.stringify({ decision, output, reason_code: reasonCode, reason_note: reasonNote, expected_revision: expectedRevision }) }); }
+  recordMarketingReview(decisionId: string, outcome: MarketingReviewOutcome, reason: string, expectedRevision: number) { return this.#request(`/marketing/decisions/${decisionId}/review`, { method: "POST", body: JSON.stringify({ outcome, reason, expected_revision: expectedRevision }) }); }
+  runGoldenEvaluation(marketingBrainVersionId: string, routerVersionId: string, split: "development" | "holdout") { return this.#request("/ai-quality/eval-runs", { method: "POST", body: JSON.stringify({ marketing_brain_version_id: marketingBrainVersionId, router_version_id: routerVersionId, split }) }); }
+  startLiveHoldout(marketingBrainVersionId: string, routerVersionId: string, idempotencyKey: string) { return this.#request("/ai-quality/live-holdout-runs", { method: "POST", body: JSON.stringify({ marketing_brain_version_id: marketingBrainVersionId, router_version_id: routerVersionId, usage_confirmed: true, idempotency_key: idempotencyKey }) }); }
+  pauseLiveHoldout(runId: string, expectedRevision: number) { return this.#request(`/ai-quality/live-holdout-runs/${runId}/pause`, { method: "POST", body: JSON.stringify({ expected_revision: expectedRevision }) }); }
   createRouterVersion(name: string, description: string, confidenceThreshold: number) { return this.#request("/ai-quality/router-versions", { method: "POST", body: JSON.stringify({ name, description, confidence_threshold: confidenceThreshold }) }); }
-  promoteAiVersion(kind: "prompt" | "router", versionId: string, expectedRevision: number) { return this.#request(`/ai-quality/${kind}-versions/${versionId}/promote`, { method: "POST", body: JSON.stringify({ expected_revision: expectedRevision }) }); }
-  rollbackAiVersion(kind: "prompt" | "router", versionId: string, expectedRevision: number) { return this.#request(`/ai-quality/${kind}-versions/${versionId}/rollback`, { method: "POST", body: JSON.stringify({ expected_revision: expectedRevision }) }); }
+  promoteAiVersion(kind: "brain" | "router", versionId: string, expectedRevision: number) { return this.#request(`/ai-quality/${kind}-versions/${versionId}/promote`, { method: "POST", body: JSON.stringify({ expected_revision: expectedRevision }) }); }
+  rollbackAiVersion(kind: "brain" | "router", versionId: string, expectedRevision: number) { return this.#request(`/ai-quality/${kind}-versions/${versionId}/rollback`, { method: "POST", body: JSON.stringify({ expected_revision: expectedRevision }) }); }
   decideNba(customerId: string, decision: NbaDecision["decision"], action: string, reason: string, expectedRevision: number) { return this.#request(`/customers/${customerId}/nba`, { method: "POST", body: JSON.stringify({ decision, action, reason, expected_revision: expectedRevision }) }); }
   addCustomerNote(customerId: string, text: string, expectedRevision: number) { return this.#request(`/customers/${customerId}/notes`, { method: "POST", body: JSON.stringify({ text, expected_revision: expectedRevision }) }); }
   decideApproval(idValue: string, decision: "approved" | "returned", reason: string, expectedRevision: number) { return this.#request(`/approvals/${idValue}`, { method: "PUT", body: JSON.stringify({ decision, reason, expected_revision: expectedRevision }) }); }

@@ -3,15 +3,18 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { z } from "zod";
-import { CustomerEvaluationSchema, WeeklyStrategySchema } from "../src/domain/schemas";
+import { ContentBriefProposalSchema, ContentDraftProposalSchema, CustomerEvaluationSchema, WeeklyStrategySchema, type AiMeta } from "../src/domain/schemas";
 import { archiveMessageEligibility, redactArchiveText, validateCustomerEvaluation } from "../src/domain/policy";
 import { actorForRole, can, canAccessCustomer } from "../src/domain/permissions";
 import { calculateQualityMetrics, evidenceFingerprint } from "../src/domain/quality";
 import { StateDataClient } from "../src/data/client";
-import type { AnalysisBatch, ApiProblem, ArchiveConsent, ArchivedMessage, ContentBrief, ConversationInsight, Customer, DomainState, Draft, EvaluationCandidate, EvaluationDecisionKind, EvaluationReasonCode, EvaluationReviewOutcome, GenerationRun, Proof, Role } from "../src/domain/types";
+import type { AnalysisBatch, ApiProblem, ArchiveConsent, ArchivedMessage, ContentBrief, ConversationInsight, Customer, DomainState, Draft, EvaluationCandidate, EvaluationDecisionKind, EvaluationReasonCode, EvaluationReviewOutcome, GenerationRun, MarketingDecisionCandidate, MarketingDecisionKind, MarketingDecisionOutput, MarketingDecisionReasonCode, MarketingReviewOutcome, MarketingTaskType, Proof, Role } from "../src/domain/types";
 import { AiServiceError, type AiConfiguration, type AiService, type ConfigurableAiService } from "./ai-service";
 import { RepositoryConflictError, SqliteStateRepository, type StateRepository } from "./repository";
 import { SessionManager } from "./session";
+import { KnowledgeService } from "./knowledge-service";
+import { LiveHoldoutRunner } from "./live-eval-runner";
+import { MARKETING_PROMPT_HASHES, marketingInputFingerprint, type MarketingPromptContext } from "./prompts";
 
 const CustomerRequestSchema = z.object({
   customer_id: z.string().optional(),
@@ -82,9 +85,33 @@ const CandidateDecisionSchema = z.object({
   expected_revision: z.number().int().min(0),
 });
 const EvaluationReviewSchema = z.object({ outcome: z.enum(["retained", "quality_reversal", "new_evidence"]), reason: z.string().max(500), expected_revision: z.number().int().min(1) });
-const EvalRunRequestSchema = z.object({ prompt_version_id: z.string(), router_version_id: z.string(), split: z.enum(["development", "holdout"]) });
-const PromptVersionRequestSchema = z.object({ name: z.string().trim().min(3).max(80), description: z.string().trim().min(3).max(500) });
-const RouterVersionRequestSchema = PromptVersionRequestSchema.extend({ confidence_threshold: z.number().int().min(50).max(95) });
+const EvalRunRequestSchema = z.object({ marketing_brain_version_id: z.string(), router_version_id: z.string(), split: z.enum(["development", "holdout"]) });
+const LiveHoldoutRequestSchema = z.object({
+  marketing_brain_version_id: z.string(),
+  router_version_id: z.string(),
+  usage_confirmed: z.literal(true),
+  idempotency_key: z.string().min(16).max(160),
+});
+const LiveHoldoutPauseSchema = z.object({ expected_revision: z.number().int().min(1) });
+const RouterVersionRequestSchema = z.object({ name: z.string().trim().min(3).max(80), description: z.string().trim().min(3).max(500), confidence_threshold: z.number().int().min(50).max(95) });
+const MarketingGenerateRequestSchema = z.object({
+  task_type: z.enum(["weekly_strategy", "content_brief", "content_draft", "customer_nba"]),
+  subject_id: z.string().min(1),
+  subject_revision: z.number().int().min(0),
+  query: z.string().trim().min(3).max(500),
+  payload: z.record(z.string(), z.unknown()),
+  market: z.string().trim().default("china"),
+  idempotency_key: z.string().min(8).max(160),
+});
+const MarketingDecisionRequestSchema = z.object({
+  decision: z.enum(["accepted", "modified", "rejected"]),
+  output: z.unknown().nullable(),
+  reason_code: z.enum(["wrong_state", "wrong_evidence", "wrong_nba", "missing_context", "risk_compliance", "too_generic", "knowledge_not_applicable", "tenant_fact_wrong", "voice_mismatch", "strategy_too_aggressive", "experiment_weak", "other"]).nullable(),
+  reason_note: z.string().max(800),
+  expected_revision: z.number().int().min(0),
+});
+const MarketingReviewSchema = z.object({ outcome: z.enum(["retained", "quality_reversal", "new_evidence"]), reason: z.string().max(800), expected_revision: z.number().int().min(1) });
+const KnowledgePreviewSchema = z.object({ task_type: z.enum(["weekly_strategy", "content_brief", "content_draft", "customer_nba"]), query: z.string().trim().min(3).max(500), market: z.string().default("china") });
 
 function isConfigurable(service: AiService): service is ConfigurableAiService {
   return "configure" in service && typeof service.configure === "function" && "getConfiguration" in service && typeof service.getConfiguration === "function";
@@ -121,6 +148,8 @@ function stateForRole(state: DomainState, role: Role) {
   if (role === "operations") {
     return {
       ...withRole,
+      marketing_candidates: withRole.marketing_candidates.filter((item) => item.task_type !== "customer_nba"),
+      marketing_decisions: withRole.marketing_decisions.filter((item) => item.task_type !== "customer_nba"),
       archive_conversations: withRole.archive_conversations.map((item) => ({ ...item, display_name: `脱敏会话 ${item.id}` })),
       archived_messages: withRole.archived_messages.map((item) => ({
         ...item,
@@ -147,12 +176,67 @@ function stateForRole(state: DomainState, role: Role) {
     generation_runs: withRole.generation_runs.filter((item) => customerIds.has(item.subject_id)),
     evaluation_candidates: withRole.evaluation_candidates.filter((item) => customerIds.has(item.customer_id)),
     evaluation_decisions: withRole.evaluation_decisions.filter((item) => item.actor === actor && customerIds.has(item.customer_id)),
+    marketing_candidates: withRole.marketing_candidates.filter((item) => item.task_type === "customer_nba" && customerIds.has(item.subject_id)),
+    marketing_decisions: withRole.marketing_decisions.filter((item) => item.task_type === "customer_nba" && item.actor === actor && customerIds.has(item.subject_id)),
     audits: withRole.audits.filter((item) => item.actor === actor),
   };
 }
 
 function stateWithRole(state: DomainState, role: Role) {
   return { ...state, role };
+}
+
+const DEMO_RETRIEVAL_QUERIES: Record<MarketingTaskType, string> = {
+  weekly_strategy: "企微周策略 客户分组 窄市场 内容实验 证据 授权",
+  content_brief: "企微朋友圈 内容 Brief 目标客户 唯一 CTA 证明",
+  content_draft: "企微朋友圈 草稿 品牌语气 证据 CTA",
+  customer_nba: "企微客户状态 下一动作 跟进 强弱证据",
+};
+
+export function bindDemoStateToActiveKnowledge(state: DomainState, tenantId: string, knowledgeService: KnowledgeService) {
+  const initialStatus = knowledgeService.status(tenantId);
+  const activeKnowledge = initialStatus.active_version;
+  const publishedBrain = state.marketing_brain_versions.find((item) => item.status === "published");
+  const publishedFacts = state.tenant_fact_versions.find((item) => item.status === "published");
+  if (!activeKnowledge || !publishedBrain || !publishedFacts) return state;
+
+  const brain = {
+    ...publishedBrain,
+    knowledge_pack_version_id: activeKnowledge.id,
+    tenant_fact_version_id: publishedFacts.id,
+    prompt_hashes: MARKETING_PROMPT_HASHES,
+  };
+  const candidates = state.marketing_candidates.map((candidate): MarketingDecisionCandidate => {
+    if (candidate.status !== "pending") return candidate;
+    try {
+      const retrieval = knowledgeService.retrieve({ tenantId, taskType: candidate.task_type, query: DEMO_RETRIEVAL_QUERIES[candidate.task_type], market: "china", channels: ["enterprise_wechat"] });
+      return {
+        ...candidate,
+        envelope: {
+          ...candidate.envelope,
+          knowledge_refs: retrieval.references,
+          skill_route: retrieval.skill_route,
+          knowledge_conflicts: retrieval.conflicts,
+          knowledge_pack_version: activeKnowledge.id,
+          tenant_fact_version: publishedFacts.id,
+          marketing_brain_version: brain.id,
+          prompt_hash: MARKETING_PROMPT_HASHES[candidate.task_type],
+          ai_meta: { ...candidate.envelope.ai_meta, prompt_version: `code-${MARKETING_PROMPT_HASHES[candidate.task_type]}` },
+        },
+      };
+    } catch {
+      return { ...candidate, status: "stale", revision: candidate.revision + 1, updated_at: new Date().toISOString() };
+    }
+  });
+  const finalStatus = knowledgeService.status(tenantId);
+  return {
+    ...state,
+    knowledge_pack_versions: finalStatus.versions,
+    knowledge_sources: finalStatus.sources,
+    knowledge_retrieval_runs: finalStatus.recent_retrievals,
+    marketing_brain_versions: state.marketing_brain_versions.map((item) => item.id === brain.id ? brain : item),
+    marketing_candidates: candidates,
+  };
 }
 
 async function mutateState(repository: StateRepository, request: Request, operation: (client: StateDataClient) => Promise<DomainState>, onCommitted?: (previous: DomainState) => void) {
@@ -187,14 +271,17 @@ export function createApp({
   aiService,
   serveDist = false,
   repository = new SqliteStateRepository(":memory:"),
+  knowledgeService = new KnowledgeService(),
   sessionManager = new SessionManager(process.env.SESSION_SECRET),
 }: {
   aiService: AiService;
   serveDist?: boolean;
   repository?: StateRepository;
+  knowledgeService?: KnowledgeService;
   sessionManager?: SessionManager;
 }) {
   const app = express();
+  const liveHoldoutRunner = new LiveHoldoutRunner(repository, aiService, knowledgeService);
   const undoSnapshots = new Map<string, { state: DomainState; expiresAt: number }>();
   const undoKey = (request: Request) => `${request.ttaSession.tenant_id}:${request.ttaSession.user_id}:${request.ttaSession.csrf_token}`;
   const rememberUndo = (request: Request) => (state: DomainState) => undoSnapshots.set(undoKey(request), { state, expiresAt: Date.now() + 10_000 });
@@ -242,6 +329,48 @@ export function createApp({
     response.json(stateForRole(loaded.state, request.ttaSession.role));
   });
 
+  app.get("/api/v2/knowledge/status", (request, response, next) => {
+    try {
+      if (!can(request.ttaSession.role, "preview_knowledge")) throw new AiServiceError(403, "FORBIDDEN", "当前角色不能查看知识治理。", false);
+      response.json(knowledgeService.status(request.ttaSession.tenant_id));
+    } catch (error) { next(error); }
+  });
+  app.post("/api/v2/knowledge/reindex", async (request, response, next) => {
+    try {
+      if (!can(request.ttaSession.role, "manage_knowledge")) throw new AiServiceError(403, "FORBIDDEN", "只有负责人可以重新索引知识包。", false);
+      knowledgeService.reindex(request.ttaSession.tenant_id);
+      const status = knowledgeService.status(request.ttaSession.tenant_id);
+      await mutateState(repository, request, (client) => client.syncKnowledgeCatalog(status.versions, status.sources, status.recent_retrievals, MARKETING_PROMPT_HASHES));
+      response.json(status);
+    } catch (error) { next(error); }
+  });
+  app.post("/api/v2/knowledge/versions/:id/activate", async (request, response, next) => {
+    try {
+      if (!can(request.ttaSession.role, "manage_knowledge")) throw new AiServiceError(403, "FORBIDDEN", "只有负责人可以激活知识版本。", false);
+      const status = knowledgeService.activate(request.ttaSession.tenant_id, request.params.id);
+      await mutateState(repository, request, (client) => client.syncKnowledgeCatalog(status.versions, status.sources, status.recent_retrievals, MARKETING_PROMPT_HASHES));
+      response.json(status);
+    } catch (error) { next(error); }
+  });
+  app.post("/api/v2/knowledge/rollback", async (request, response, next) => {
+    try {
+      if (!can(request.ttaSession.role, "manage_knowledge")) throw new AiServiceError(403, "FORBIDDEN", "只有负责人可以回滚知识版本。", false);
+      const status = knowledgeService.rollback(request.ttaSession.tenant_id);
+      await mutateState(repository, request, (client) => client.syncKnowledgeCatalog(status.versions, status.sources, status.recent_retrievals, MARKETING_PROMPT_HASHES));
+      response.json(status);
+    } catch (error) { next(error); }
+  });
+  app.post("/api/v2/knowledge/retrieval-preview", async (request, response, next) => {
+    try {
+      if (!can(request.ttaSession.role, "preview_knowledge")) throw new AiServiceError(403, "FORBIDDEN", "当前角色不能预览知识检索。", false);
+      const input = KnowledgePreviewSchema.parse(request.body);
+      const result = knowledgeService.retrieve({ tenantId: request.ttaSession.tenant_id, taskType: input.task_type, query: input.query, market: input.market, channels: ["enterprise_wechat"] });
+      const status = knowledgeService.status(request.ttaSession.tenant_id);
+      await mutateState(repository, request, (client) => client.syncKnowledgeCatalog(status.versions, status.sources, status.recent_retrievals, MARKETING_PROMPT_HASHES));
+      response.json(result);
+    } catch (error) { next(error); }
+  });
+
   app.put("/api/v2/drafts/:id", async (request, response, next) => {
     try {
       const body = request.body as { draft: Draft; expected_revision: number };
@@ -269,6 +398,30 @@ export function createApp({
   app.post("/api/v2/evaluation-decisions/:id/review", async (request, response, next) => {
     try { const body = EvaluationReviewSchema.parse(request.body); response.json(await mutateState(repository, request, (client) => client.recordEvaluationReview(request.params.id, body.outcome as EvaluationReviewOutcome, body.reason, body.expected_revision))); }
     catch (error) { next(error); }
+  });
+  app.post("/api/v2/marketing/candidates/:id/decision", async (request, response, next) => {
+    try {
+      const body = MarketingDecisionRequestSchema.parse(request.body);
+      const state = repository.load(request.ttaSession.tenant_id).state;
+      const candidate = state.marketing_candidates.find((item) => item.id === request.params.id);
+      if (!candidate) throw new AiServiceError(404, "MARKETING_CANDIDATE_NOT_FOUND", "营销决策候选不存在。", false);
+      let output: MarketingDecisionOutput | null = null;
+      if (body.decision === "modified") {
+        output = candidate.task_type === "weekly_strategy" ? WeeklyStrategySchema.parse(body.output)
+          : candidate.task_type === "content_brief" ? ContentBriefProposalSchema.parse(body.output)
+            : candidate.task_type === "content_draft" ? ContentDraftProposalSchema.parse(body.output)
+              : CustomerEvaluationSchema.parse(body.output);
+      }
+      const knowledge = knowledgeService.status(request.ttaSession.tenant_id).active_version;
+      if (!knowledge || knowledge.id !== candidate.envelope.knowledge_pack_version) throw new AiServiceError(409, "STALE_MARKETING_CANDIDATE", "知识版本已变化，请重新生成候选。", true);
+      response.json(await mutateState(repository, request, (client) => client.decideMarketingCandidate(candidate.id, body.decision as MarketingDecisionKind, output, body.reason_code as MarketingDecisionReasonCode | null, body.reason_note, body.expected_revision)));
+    } catch (error) { next(error); }
+  });
+  app.post("/api/v2/marketing/decisions/:id/review", async (request, response, next) => {
+    try {
+      const body = MarketingReviewSchema.parse(request.body);
+      response.json(await mutateState(repository, request, (client) => client.recordMarketingReview(request.params.id, body.outcome as MarketingReviewOutcome, body.reason, body.expected_revision)));
+    } catch (error) { next(error); }
   });
   app.post("/api/v2/customers/:id/nba", async (request, response, next) => {
     try { const body = request.body; response.json(await mutateState(repository, request, (client) => client.decideNba(request.params.id, body.decision, body.action, body.reason, body.expected_revision))); }
@@ -342,7 +495,7 @@ export function createApp({
     } catch (error) { next(error); }
   });
   app.post("/api/v2/ai-quality/prompt-versions", async (request, response, next) => {
-    try { const body = PromptVersionRequestSchema.parse(request.body); response.json(await mutateState(repository, request, (client) => client.createPromptVersion(body.name, body.description))); }
+    try { throw new AiServiceError(410, "LEGACY_PROMPT_VERSION_DISABLED", "2.2 Prompt 由代码 builder 和内容哈希版本化，不能创建仅名称与描述的空壳版本。", false); }
     catch (error) { next(error); }
   });
   app.post("/api/v2/ai-quality/router-versions", async (request, response, next) => {
@@ -350,13 +503,29 @@ export function createApp({
     catch (error) { next(error); }
   });
   app.post("/api/v2/ai-quality/eval-runs", async (request, response, next) => {
-    try { const body = EvalRunRequestSchema.parse(request.body); response.json(await mutateState(repository, request, (client) => client.runGoldenEvaluation(body.prompt_version_id, body.router_version_id, body.split))); }
+    try { const body = EvalRunRequestSchema.parse(request.body); response.json(await mutateState(repository, request, (client) => client.runGoldenEvaluation(body.marketing_brain_version_id, body.router_version_id, body.split))); }
     catch (error) { next(error); }
+  });
+  app.post("/api/v2/ai-quality/live-holdout-runs", (request, response, next) => {
+    try {
+      if (!can(request.ttaSession.role, "publish_ai_version")) throw new AiServiceError(403, "FORBIDDEN", "只有负责人可以确认用量并启动真实 Holdout。", false);
+      const body = LiveHoldoutRequestSchema.parse(request.body);
+      const state = liveHoldoutRunner.start({ tenantId: request.ttaSession.tenant_id, actor: actorForRole(request.ttaSession.role), marketingBrainVersionId: body.marketing_brain_version_id, routerVersionId: body.router_version_id, idempotencyKey: body.idempotency_key });
+      response.status(202).json(stateForRole(state, request.ttaSession.role));
+    } catch (error) { next(error); }
+  });
+  app.post("/api/v2/ai-quality/live-holdout-runs/:id/pause", (request, response, next) => {
+    try {
+      if (!can(request.ttaSession.role, "publish_ai_version")) throw new AiServiceError(403, "FORBIDDEN", "只有负责人可以暂停真实 Holdout。", false);
+      const body = LiveHoldoutPauseSchema.parse(request.body);
+      const state = liveHoldoutRunner.pause(request.ttaSession.tenant_id, request.params.id, actorForRole(request.ttaSession.role), body.expected_revision);
+      response.json(stateForRole(state, request.ttaSession.role));
+    } catch (error) { next(error); }
   });
   app.post("/api/v2/ai-quality/:kind-versions/:id/promote", async (request, response, next) => {
     try {
       const kind = request.params.kind;
-      if (kind !== "prompt" && kind !== "router") throw new AiServiceError(404, "NOT_FOUND", "AI 版本类型不存在", false);
+      if (kind !== "brain" && kind !== "router") throw new AiServiceError(404, "NOT_FOUND", "AI 版本类型不存在", false);
       const body = ExpectedRevisionSchema.parse(request.body);
       response.json(await mutateState(repository, request, (client) => client.promoteAiVersion(kind, request.params.id, body.expected_revision)));
     } catch (error) { next(error); }
@@ -364,7 +533,7 @@ export function createApp({
   app.post("/api/v2/ai-quality/:kind-versions/:id/rollback", async (request, response, next) => {
     try {
       const kind = request.params.kind;
-      if (kind !== "prompt" && kind !== "router") throw new AiServiceError(404, "NOT_FOUND", "AI 版本类型不存在", false);
+      if (kind !== "brain" && kind !== "router") throw new AiServiceError(404, "NOT_FOUND", "AI 版本类型不存在", false);
       const body = ExpectedRevisionSchema.parse(request.body);
       response.json(await mutateState(repository, request, (client) => client.rollbackAiVersion(kind, request.params.id, body.expected_revision)));
     } catch (error) { next(error); }
@@ -384,13 +553,15 @@ export function createApp({
     try {
       undoSnapshots.delete(undoKey(request));
       const reset = repository.reset(request.ttaSession.tenant_id);
-      response.json(stateForRole(reset.state, request.ttaSession.role));
+      const hydrated = bindDemoStateToActiveKnowledge(reset.state, request.ttaSession.tenant_id, knowledgeService);
+      const saved = hydrated === reset.state ? reset : repository.save(request.ttaSession.tenant_id, hydrated, reset.repositoryRevision);
+      response.json(stateForRole(saved.state, request.ttaSession.role));
     } catch (error) { next(error); }
   });
 
   app.get("/api/v2/health", (_request, response) => {
     const configuration = describeConfiguration(aiService);
-    response.json({ ok: true, ai_configured: configuration.configured, model: configuration.model, fast_model: configuration.fast_model, fast_model_available: configuration.fast_model_available, config_source: configuration.source, configured_at: configuration.configured_at, data_mode: "http-sqlite", session_warning: sessionManager.securityWarning });
+    response.json({ ok: true, ai_configured: configuration.configured, knowledge_configured: knowledgeService.configured, model: configuration.model, fast_model: configuration.fast_model, fast_model_available: configuration.fast_model_available, config_source: configuration.source, configured_at: configuration.configured_at, data_mode: "http-sqlite", session_warning: sessionManager.securityWarning });
   });
 
   app.get("/api/v2/ai/config", (_request, response) => {
@@ -411,6 +582,87 @@ export function createApp({
       assertLocalConfigurationRequest(request);
       if (!isConfigurable(aiService)) throw new AiServiceError(501, "LOCAL_CONFIG_UNAVAILABLE", "当前 BFF 不支持运行时配置。", false);
       response.json(aiService.resetRuntimeConfiguration());
+    } catch (error) { next(error); }
+  });
+
+  app.post("/api/v2/marketing/candidates/generate", createRateLimiter(), async (request, response, next) => {
+    try {
+      const input = MarketingGenerateRequestSchema.parse(request.body);
+      const operation = `marketing-${input.task_type}`;
+      const cached = repository.getIdempotent<{ candidate: MarketingDecisionCandidate }>(request.ttaSession.tenant_id, input.idempotency_key, operation);
+      if (cached) { response.json(cached); return; }
+      const required = input.task_type === "customer_nba" ? "evaluate_customer" : input.task_type === "weekly_strategy" ? "generate_strategy" : input.task_type === "content_brief" ? "manage_brief" : "edit_draft";
+      if (!can(request.ttaSession.role, required)) throw new AiServiceError(403, "FORBIDDEN", "当前角色不能生成该营销决策候选。", false);
+
+      let state = stateWithRole(repository.load(request.ttaSession.tenant_id).state, request.ttaSession.role);
+      const customer = input.task_type === "customer_nba" ? state.customers.find((item) => item.id === input.subject_id) : null;
+      const brief = input.task_type === "content_brief" ? state.content_briefs.find((item) => item.id === input.subject_id) : null;
+      const draft = input.task_type === "content_draft" ? state.drafts.find((item) => item.id === input.subject_id) : null;
+      const subject = customer ?? brief ?? draft;
+      if (input.task_type !== "weekly_strategy" && !subject) throw new AiServiceError(404, "SUBJECT_NOT_FOUND", "营销决策关联的业务对象不存在。", false);
+      if (customer && !canAccessCustomer(request.ttaSession.role, customer)) throw new AiServiceError(404, "NOT_FOUND", "客户不存在或不在当前可见范围。", false);
+      if ((subject?.revision ?? 1) !== input.subject_revision) throw new AiServiceError(409, "VERSION_CONFLICT", "业务对象已更新，请刷新后重试。", true);
+
+      const retrieval = knowledgeService.retrieve({ tenantId: request.ttaSession.tenant_id, taskType: input.task_type, query: input.query, market: input.market, channels: ["enterprise_wechat"], stages: draft ? [draft.stage] : brief ? [brief.stage] : undefined });
+      let knowledgeStatus = knowledgeService.status(request.ttaSession.tenant_id);
+      await mutateState(repository, request, (client) => client.syncKnowledgeCatalog(knowledgeStatus.versions, knowledgeStatus.sources, knowledgeStatus.recent_retrievals, MARKETING_PROMPT_HASHES));
+      state = stateWithRole(repository.load(request.ttaSession.tenant_id).state, request.ttaSession.role);
+      const activeBrain = state.marketing_brain_versions.find((item) => item.status === "published");
+      const factVersion = state.tenant_fact_versions.find((item) => item.status === "published");
+      const activeKnowledge = knowledgeStatus.active_version;
+      if (!activeBrain || !factVersion || !activeKnowledge) throw new AiServiceError(422, "MARKETING_BRAIN_NOT_PUBLISHED", "知识、企业事实或营销脑版本尚未发布。", false);
+      const promptBindingChanged = (Object.keys(MARKETING_PROMPT_HASHES) as MarketingTaskType[]).some((task) => activeBrain.prompt_hashes[task] !== MARKETING_PROMPT_HASHES[task]);
+      if (activeBrain.knowledge_pack_version_id !== activeKnowledge.id || activeBrain.tenant_fact_version_id !== factVersion.id || promptBindingChanged) {
+        throw new AiServiceError(409, "MARKETING_BRAIN_BINDING_PENDING", "知识包、企业事实或代码化 Prompt 已变化，负责人需先评测并发布新的营销脑版本。", false);
+      }
+      const today = Date.now();
+      const facts = factVersion.facts.filter((item) => item.status === "published" && new Date(item.valid_from).getTime() <= today && (!item.expires_at || new Date(item.expires_at).getTime() >= today));
+      if (!facts.length) throw new AiServiceError(422, "TENANT_FACTS_NOT_PUBLISHED", "没有已发布且有效的企业事实，生成已阻断。", false);
+
+      const businessEvidenceRefs = input.task_type === "customer_nba" ? customer!.evidence.filter((item) => item.valid).map((item) => item.id)
+        : input.task_type === "content_brief" ? brief!.insight_ids.filter((id) => state.conversation_insights.some((item) => item.id === id && item.status === "accepted" && !item.invalidated_reason))
+          : input.task_type === "content_draft" ? [...new Set([...draft!.evidence_refs, ...(state.content_briefs.find((item) => item.id === draft!.brief_id)?.insight_ids ?? [])])]
+            : [...state.conversation_insights.filter((item) => item.status === "accepted" && !item.invalidated_reason).map((item) => item.id), ...state.proofs.filter((item) => item.status === "usable").map((item) => item.id)];
+      if (!businessEvidenceRefs.length) throw new AiServiceError(422, "BUSINESS_EVIDENCE_REQUIRED", "没有可用的业务证据，营销决策生成已阻断。", false);
+      const brainContext: MarketingPromptContext = { skill_route: retrieval.skill_route, knowledge_refs: retrieval.references, tenant_facts: facts, business_evidence_refs: businessEvidenceRefs, knowledge_conflicts: retrieval.conflicts, growth_posture: "aggressive" };
+
+      let generated: { data: MarketingDecisionOutput; meta: AiMeta };
+      if (input.task_type === "weekly_strategy") {
+        generated = await aiService.weeklyStrategy({ ...input.payload, accepted_insights: state.conversation_insights.filter((item) => item.status === "accepted"), historical_outcomes: state.content_outcomes, brain_context: brainContext });
+        const ratio = generated.data as ReturnType<typeof WeeklyStrategySchema.parse>;
+        if (ratio.ratio.trust + ratio.ratio.interest + ratio.ratio.desire + ratio.ratio.action !== 100) throw new AiServiceError(422, "POLICY_BLOCKED", "内容配比总和必须为 100。", false);
+        if (ratio.evidence_refs.some((id) => !businessEvidenceRefs.includes(id))) throw new AiServiceError(422, "UNKNOWN_BUSINESS_REFERENCE", "周策略引用了未知业务证据。", false);
+      } else if (input.task_type === "content_brief") {
+        const accepted = state.conversation_insights.filter((item) => brief!.insight_ids.includes(item.id) && item.status === "accepted" && !item.invalidated_reason);
+        if (!accepted.length) throw new AiServiceError(422, "INSIGHT_NOT_ACCEPTED", "内容 Brief 只能使用已接受且有效的洞察。", false);
+        generated = await aiService.contentBrief({ accepted_insights: accepted, historical_outcomes: state.content_outcomes, brain_context: brainContext });
+        if ((generated.data as ReturnType<typeof ContentBriefProposalSchema.parse>).insight_refs.some((id) => !businessEvidenceRefs.includes(id))) throw new AiServiceError(422, "UNKNOWN_INSIGHT_REFERENCE", "Brief 引用了未知洞察。", false);
+      } else if (input.task_type === "content_draft") {
+        const selectedProofs = state.proofs.filter((item) => draft!.evidence_refs.includes(item.id));
+        generated = await aiService.contentDraft({ strategy: state.weekly_plan.strategy, proofs: selectedProofs, stage: draft!.stage, brief: state.content_briefs.find((item) => item.id === draft!.brief_id), accepted_insights: state.conversation_insights.filter((item) => item.status === "accepted"), historical_outcomes: state.content_outcomes, low_risk_rewrite: !draft!.approval_required, brain_context: brainContext });
+        if ((generated.data as ReturnType<typeof ContentDraftProposalSchema.parse>).evidence_refs.some((id) => !businessEvidenceRefs.includes(id))) throw new AiServiceError(422, "UNKNOWN_BUSINESS_REFERENCE", "草稿引用了未知业务证据。", false);
+      } else {
+        generated = await aiService.customerEvaluation({ customer, brain_context: brainContext });
+        const policy = validateCustomerEvaluation(customer!, generated.data as ReturnType<typeof CustomerEvaluationSchema.parse>);
+        if (!policy.allowed) throw new AiServiceError(422, policy.code, policy.reasons.join("；"), false);
+      }
+
+      knowledgeStatus = knowledgeService.status(request.ttaSession.tenant_id);
+      const createdAt = new Date().toISOString();
+      const fingerprint = marketingInputFingerprint({ task_type: input.task_type, subject_id: input.subject_id, subject_revision: input.subject_revision, payload: input.payload }, brainContext);
+      const candidate: MarketingDecisionCandidate = {
+        id: `marketing-candidate-${crypto.randomUUID()}`, revision: 1, updated_at: createdAt, task_type: input.task_type as MarketingTaskType, subject_id: input.subject_id,
+        subject_revision: input.subject_revision, evidence_fingerprint: fingerprint,
+        envelope: { task_type: input.task_type as MarketingTaskType, output: generated.data, business_evidence_refs: businessEvidenceRefs, knowledge_refs: retrieval.references, skill_route: retrieval.skill_route,
+          assumptions: ["当前结果基于合成业务数据", "服务容量与人工执行边界保持不变"], knowledge_conflicts: retrieval.conflicts,
+          measurement_plan: ["48 小时内完成候选审阅", "采用后 7 天记录保持有效、质量撤销或新增证据"], growth_posture: "aggressive", ai_meta: { ...generated.meta, input_fingerprint: fingerprint },
+          knowledge_pack_version: activeKnowledge.id, tenant_fact_version: factVersion.id, marketing_brain_version: activeBrain.id, prompt_hash: MARKETING_PROMPT_HASHES[input.task_type], input_fingerprint: fingerprint },
+        status: "pending", created_at: createdAt, expires_at: new Date(Date.now() + 48 * 60 * 60_000).toISOString(), decided_at: null, decision_id: null,
+      };
+      await mutateState(repository, request, (client) => client.saveMarketingCandidate(candidate));
+      const result = { candidate };
+      repository.saveIdempotent(request.ttaSession.tenant_id, input.idempotency_key, operation, result);
+      response.json(result);
     } catch (error) { next(error); }
   });
 

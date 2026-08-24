@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createFixtureState } from "./fixtures";
-import { calculateQualityMetrics, candidateIsStale, scoreSyntheticGoldenSet } from "./quality";
+import { calculateQualityMetrics, candidateIsStale, scoreGoldenReplay } from "./quality";
 
 describe("AI quality metrics", () => {
   it("counts only unchanged original adoption as the North Star numerator", () => {
@@ -37,18 +37,26 @@ describe("AI quality metrics", () => {
   it("requires absolute adoption, baseline lift, safety, slices and latency together", () => {
     const state = createFixtureState();
     const holdout = state.golden_cases.filter((item) => item.split === "holdout");
-    const baseline = scoreSyntheticGoldenSet(holdout, false);
-    const candidate = scoreSyntheticGoldenSet(holdout, true);
+    const baseline = scoreGoldenReplay(holdout, false);
+    const candidate = scoreGoldenReplay(holdout, true);
 
     expect(baseline.passed).toBe(false);
-    expect(candidate).toMatchObject({
-      passed: true,
-      first_draft_adoption: 72.5,
-      adoption_improvement_points: 17.5,
-      evidence_precision: 100,
-      policy_violations: 0,
-      privacy_leaks: 0,
-    });
+    expect(candidate).toMatchObject({ passed: true, evidence_precision: 100, knowledge_citation_precision: 100, business_evidence_precision: 100, policy_violations: 0, privacy_leaks: 0 });
+    expect(candidate.macro_adoption_rate).toBeGreaterThanOrEqual(70);
+    expect(candidate.adoption_improvement_points).toBeGreaterThanOrEqual(15);
+    expect(candidate.review_coverage_rate).toBeGreaterThanOrEqual(80);
+    expect(Object.values(candidate.task_adoption_rates).every((rate) => rate >= 60)).toBe(true);
+    expect(candidate.knowledge_recall_at_5).toBeGreaterThanOrEqual(95);
     expect(candidate.critical_slice_regression).toBeLessThanOrEqual(2);
+  });
+
+  it("builds the 352/88 four-task evaluation split", () => {
+    const cases = createFixtureState().golden_cases;
+    expect(cases).toHaveLength(440);
+    expect(cases.filter((item) => item.split === "development")).toHaveLength(352);
+    expect(cases.filter((item) => item.split === "holdout")).toHaveLength(88);
+    for (const task of ["weekly_strategy", "content_brief", "content_draft", "customer_nba"] as const) {
+      expect(cases.filter((item) => item.task_type === task)).toHaveLength(task === "customer_nba" ? 200 : 80);
+    }
   });
 });

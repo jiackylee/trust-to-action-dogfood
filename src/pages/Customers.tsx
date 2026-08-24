@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { AlertTriangle, ArrowLeft, ArrowRight, Bot, CalendarClock, Check, CheckSquare, ChevronRight, Clock3, GitCompareArrows, MessageSquareText, Search, Sparkles, UserRound, UsersRound, X } from "lucide-react";
 import { Link, useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { aiClient } from "../data/ai-client";
 import { STATE_LABELS, type CustomerEvaluation, type EvidenceStrength, type StateCode } from "../domain/schemas";
 import type { Customer, EvaluationDecisionKind, EvaluationReasonCode } from "../domain/types";
 import { EmptyState, EvidenceBadge, InlineAlert, LoadingState, SectionHeader, StateBadge } from "../components/UI";
@@ -9,6 +8,7 @@ import { useAppStore } from "../store/AppStore";
 import { actorForRole, can, canAccessCustomer } from "../domain/permissions";
 import type { NbaDecision } from "../domain/types";
 import { candidateIsStale } from "../domain/quality";
+import { MarketingDecisionPanel } from "../components/MarketingDecisionPanel";
 
 const SCROLL_KEY = "tta-v2-customers-scroll";
 const REASON_LABELS: Record<EvaluationReasonCode, string> = {
@@ -22,7 +22,7 @@ const REASON_LABELS: Record<EvaluationReasonCode, string> = {
 };
 
 export function Customers() {
-  const { state, loading, health, reload, explainError, notify } = useAppStore();
+  const { state, loading, health, generateMarketingCandidate, explainError, notify } = useAppStore();
   const [params, setParams] = useSearchParams();
   const location = useLocation();
   const [selected, setSelected] = useState<string[]>([]);
@@ -49,13 +49,19 @@ export function Customers() {
   function updateParam(key: string, value: string) { const next = new URLSearchParams(params); value === "all" || !value ? next.delete(key) : next.set(key, value); setParams(next, { replace: true }); }
   function toggle(id: string) { setSelected((items) => items.includes(id) ? items.filter((item) => item !== id) : items.length < 10 ? [...items, id] : items); }
   async function evaluateBatch() {
+    if (!state) return;
     setEvaluating(true); setError(null);
     try {
-      const result = await aiClient.customerEvaluationBatch(selected.slice(0, 10));
-      const completed = result.results.filter((item) => item.candidate).length;
-      const failed = result.results.length - completed;
-      await reload();
-      setSelected(result.results.filter((item) => item.error).map((item) => item.customer_id));
+      const failedIds: string[] = [];
+      let completed = 0;
+      for (const customerId of selected.slice(0, 10)) {
+        const customer = state.customers.find((item) => item.id === customerId);
+        if (!customer) { failedIds.push(customerId); continue; }
+        try { await generateMarketingCandidate("customer_nba", customer.id, customer.revision, `${customer.industry} ${customer.state} 客户状态 下一最佳动作 企微跟进证据`, { customer_id: customer.id }); completed += 1; }
+        catch { failedIds.push(customerId); }
+      }
+      const failed = failedIds.length;
+      setSelected(failedIds);
       notify({ title: `已生成 ${completed} 条评估候选`, detail: failed ? `${failed} 位未完成并保持选择，可修正后重试。` : "客户状态尚未改变，等待负责销售审阅。", tone: failed ? "warning" : "success" });
     } catch (cause) { setError(explainError(cause)); } finally { setEvaluating(false); }
   }
@@ -71,7 +77,7 @@ export function Customers() {
       <span className="filter-count">{customers.length} / {state.customers.filter((item) => canAccessCustomer(state.role, item)).length} 位</span>
     </div>
     {!customers.length ? <EmptyState title="没有匹配的客户" detail="调整负责人、状态或证据筛选后再试。" action={<button className="secondary-button" onClick={() => setParams({})}>清空筛选</button>} /> : <>
-      <div className="table-wrap desktop-table customers-table"><table><thead><tr><th className="checkbox-cell"><input type="checkbox" aria-label="选择当前列表前十位" checked={Boolean(customers.length) && customers.slice(0, 10).every((item) => selected.includes(item.id))} onChange={(event) => setSelected(event.target.checked ? customers.slice(0, 10).map((item) => item.id) : [])} /></th><th>客户</th><th>状态 / 置信度</th><th>证据</th><th>最近互动</th><th>下一最佳动作</th><th>AI 候选</th><th>复查时间</th><th /></tr></thead><tbody>{customers.map((customer) => { const pending = state.evaluation_candidates.find((item) => item.customer_id === customer.id && item.status === "pending"); return <tr key={customer.id}><td><input type="checkbox" aria-label={`选择 ${customer.name}`} checked={selected.includes(customer.id)} onChange={() => toggle(customer.id)} /></td><td><Link className="customer-name" to={`/customers/${customer.id}`} state={{ from: location.pathname + location.search }}><strong>{customer.name}</strong><small>{customer.company}</small></Link><span className="owner-line"><UserRound />{customer.owner}{customer.shared && " · 共享"}</span></td><td><StateBadge state={customer.state} /><small className="confidence-line"><i><b style={{ width: `${customer.confidence}%` }} /></i>{customer.confidence}%</small></td><td><EvidenceBadge strength={customer.evidence_strength} /><small>{customer.evidence.filter((item) => item.valid).length} 条有效引用</small></td><td className="interaction-cell"><span>{customer.last_interaction}</span><small>{relativeDate(customer.last_interaction_at)}</small></td><td><strong>{customer.evaluation?.recommendation ?? "待评估"}</strong><small>{customer.evaluation?.cta}</small></td><td>{pending ? <Link className="candidate-pill" to={`/customers/${customer.id}`}><Sparkles />待销售判断</Link> : <span className="muted">—</span>}</td><td><span className={new Date(customer.review_at).getTime() < Date.now() ? "warning-text" : ""}>{shortDate(customer.review_at)}</span>{customer.anomaly && <small className="danger-text">{customer.anomaly}</small>}</td><td><Link className="icon-button" aria-label={`查看 ${customer.name} 详情`} title="查看客户详情" to={`/customers/${customer.id}`} state={{ from: location.pathname + location.search }}><ChevronRight /></Link></td></tr>; })}</tbody></table></div>
+      <div className="table-wrap desktop-table customers-table"><table><thead><tr><th className="checkbox-cell"><input type="checkbox" aria-label="选择当前列表前十位" checked={Boolean(customers.length) && customers.slice(0, 10).every((item) => selected.includes(item.id))} onChange={(event) => setSelected(event.target.checked ? customers.slice(0, 10).map((item) => item.id) : [])} /></th><th>客户</th><th>状态 / 置信度</th><th>证据</th><th>最近互动</th><th>下一最佳动作</th><th>AI 候选</th><th>复查时间</th><th /></tr></thead><tbody>{customers.map((customer) => { const pending = state.marketing_candidates.find((item) => item.task_type === "customer_nba" && item.subject_id === customer.id && item.status === "pending") ?? state.evaluation_candidates.find((item) => item.customer_id === customer.id && item.status === "pending"); return <tr key={customer.id}><td><input type="checkbox" aria-label={`选择 ${customer.name}`} checked={selected.includes(customer.id)} onChange={() => toggle(customer.id)} /></td><td><Link className="customer-name" to={`/customers/${customer.id}`} state={{ from: location.pathname + location.search }}><strong>{customer.name}</strong><small>{customer.company}</small></Link><span className="owner-line"><UserRound />{customer.owner}{customer.shared && " · 共享"}</span></td><td><StateBadge state={customer.state} /><small className="confidence-line"><i><b style={{ width: `${customer.confidence}%` }} /></i>{customer.confidence}%</small></td><td><EvidenceBadge strength={customer.evidence_strength} /><small>{customer.evidence.filter((item) => item.valid).length} 条有效引用</small></td><td className="interaction-cell"><span>{customer.last_interaction}</span><small>{relativeDate(customer.last_interaction_at)}</small></td><td><strong>{customer.evaluation?.recommendation ?? "待评估"}</strong><small>{customer.evaluation?.cta}</small></td><td>{pending ? <Link className="candidate-pill" to={`/customers/${customer.id}`}><Sparkles />待销售判断</Link> : <span className="muted">—</span>}</td><td><span className={new Date(customer.review_at).getTime() < Date.now() ? "warning-text" : ""}>{shortDate(customer.review_at)}</span>{customer.anomaly && <small className="danger-text">{customer.anomaly}</small>}</td><td><Link className="icon-button" aria-label={`查看 ${customer.name} 详情`} title="查看客户详情" to={`/customers/${customer.id}`} state={{ from: location.pathname + location.search }}><ChevronRight /></Link></td></tr>; })}</tbody></table></div>
       <div className="mobile-card-list customer-cards">{visibleCustomers.map((customer) => <article className="mobile-card" key={customer.id}><div className="mobile-card-head"><label className="mobile-check"><input type="checkbox" checked={selected.includes(customer.id)} onChange={() => toggle(customer.id)} /><span className="sr-only">选择 {customer.name}</span></label><StateBadge state={customer.state} /></div><h2>{customer.name} <small>{customer.company}</small></h2><div className="card-badges"><EvidenceBadge strength={customer.evidence_strength} /><span>{customer.confidence}% 置信</span></div><p>{customer.last_interaction}</p><div className="nba-mini"><span>下一最佳动作</span><strong>{customer.evaluation?.recommendation}</strong><small>{customer.evaluation?.cta}</small></div><Link className="secondary-button full" to={`/customers/${customer.id}`} state={{ from: location.pathname + location.search }}>查看 {customer.name} 的状态与动作 <ArrowRight /></Link></article>)}</div>
       {visibleCount < customers.length && <button className="secondary-button mobile-load-more" onClick={() => setVisibleCount((count) => count + 8)}>继续加载（剩余 {customers.length - visibleCount} 位）</button>}
       {selected.length > 0 && <div className="mobile-selection-bar" role="status"><strong>已选 {selected.length} 位</strong><button className="primary-button" disabled={evaluating} onClick={() => void evaluateBatch()}><Sparkles />批量评估</button><button className="icon-button" aria-label="清空选择" onClick={() => setSelected([])}><X /></button></div>}
@@ -83,7 +89,7 @@ export function CustomerDetail() {
   const { customerId } = useParams();
   const location = useLocation();
   const navigate = useNavigate();
-  const { state, loading, health, reload, decideEvaluationCandidate, decideNba, addCustomerNote, explainError, notify } = useAppStore();
+  const { state, loading, health, generateMarketingCandidate, decideEvaluationCandidate, decideNba, addCustomerNote, explainError } = useAppStore();
   const [evaluating, setEvaluating] = useState(false);
   const [error, setError] = useState<{ code: string; message: string } | null>(null);
   const [note, setNote] = useState("");
@@ -102,6 +108,7 @@ export function CustomerDetail() {
   if (!customer) return <EmptyState title="客户不存在" detail="该演示客户可能已被重置。" action={<Link className="secondary-button" to="/customers">返回客户列表</Link>} />;
   const currentCustomer = customer;
   const candidate = state.evaluation_candidates.find((item) => item.customer_id === customer.id && item.status === "pending");
+  const marketingCandidate = state.marketing_candidates.find((item) => item.task_type === "customer_nba" && item.subject_id === customer.id && item.status === "pending");
   const staleCandidate = candidate ? candidateIsStale(state, candidate) || new Date(candidate.expires_at).getTime() < Date.now() : false;
   const canHandleNba = can(state.role, "record_task") && canAccessCustomer(state.role, customer);
   const canReviewCandidate = can(state.role, "review_evaluation") && customer.owner === actorForRole("sales");
@@ -109,9 +116,7 @@ export function CustomerDetail() {
   async function evaluate() {
     setEvaluating(true); setError(null);
     try {
-      const result = await aiClient.customerEvaluation(currentCustomer);
-      await reload();
-      notify({ title: "AI 评估候选已生成", detail: `${currentCustomer.state} → ${result.candidate.evaluation.state_after} · 等待负责销售判断`, tone: "success" });
+      await generateMarketingCandidate("customer_nba", currentCustomer.id, currentCustomer.revision, `${currentCustomer.industry} ${currentCustomer.state} 客户状态 下一最佳动作 强弱证据`, { customer_id: currentCustomer.id });
     } catch (cause) { setError(explainError(cause)); } finally { setEvaluating(false); }
   }
   async function handleCandidateDecision(decision: EvaluationDecisionKind) {
@@ -142,6 +147,7 @@ export function CustomerDetail() {
     <button className="back-button" onClick={() => navigate(backTo)}><ArrowLeft />返回原筛选</button>
     <SectionHeader eyebrow={`${customer.company} · ${customer.title}`} title={customer.name} description={`${customer.owner} 负责 · 来源：${customer.source} · 最近互动 ${relativeDate(customer.last_interaction_at)}`} actions={<button className="primary-button" onClick={() => void evaluate()} disabled={evaluating}><Bot />{evaluating ? "正在评估…" : "AI 重新评估"}</button>} />
     {error && <InlineAlert tone="danger" title="操作未完成">{error.message} <button className="text-button" onClick={() => void evaluate()}>重试</button><details className="technical-details"><summary>技术详情</summary><code>{error.code}</code></details></InlineAlert>}
+    {marketingCandidate && <MarketingDecisionPanel candidate={marketingCandidate} currentRevision={currentCustomer.revision} />}
     {candidate && <section className={`evaluation-candidate-panel ${staleCandidate ? "candidate-stale" : ""}`}>
       <div className="candidate-title"><span><Sparkles /><b>AI 待判断候选</b><small>{candidate.ai_meta.model} · {candidate.ai_meta.route_reason ?? "默认路由"} · {candidate.ai_meta.attempts ?? 1} 次调用</small></span><span className="candidate-age">{relativeDate(candidate.created_at)}生成</span></div>
       {staleCandidate ? <InlineAlert tone="warning" title="候选已过期">客户 revision 或证据已经变化，当前候选不能写入。请重新生成。</InlineAlert> : <>
@@ -169,6 +175,7 @@ export function CustomerDetail() {
       </section>
     </div>
     {!health?.ai_configured && <InlineAlert tone="warning" title="真实模型未配置">重新评估当前不可用；客户状态会保持不变，也不会生成替代结果。</InlineAlert>}
+    {!health?.knowledge_configured && <InlineAlert tone="warning" title="知识增强未就绪">未激活私有知识包时客户评估会明确阻断，不会生成无知识依据的 NBA。</InlineAlert>}
     <div className="detail-grid">
       <section className="panel"><div className="panel-heading"><div><span className="eyebrow">微信客服</span><h2>近 3 天摘要</h2></div><MessageSquareText /></div><p>{customer.kf_summary}</p><InlineAlert tone="info" title="只读同步">回复建议仅作为草稿，不调用发送接口。</InlineAlert></section>
       <section className="panel"><div className="panel-heading"><div><span className="eyebrow">人工补充</span><h2>销售私聊笔记</h2></div><UsersRound /></div><label className="field"><span>事实或结果</span><textarea className="note-area" placeholder="记录未接入会话存档的私聊事实…" value={note} onChange={(event) => setNote(event.target.value)} /></label><button className="secondary-button" disabled={!note.trim() || savingNote} onClick={() => void saveNote()}><CheckSquare />{savingNote ? "正在记录" : "记录笔记"}</button>{customer.notes.map((item) => <div className="saved-note" key={item.id}><p>{item.text}</p><small>{item.actor} · {shortDate(item.at)}</small></div>)}</section>

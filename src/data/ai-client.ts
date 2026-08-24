@@ -1,5 +1,5 @@
 import type { AiResult, ContentBriefProposal, ContentDraftProposal, ConversationInsights, CustomerEvaluation, RiskReview, WeeklyRetrospective, WeeklyStrategy } from "../domain/schemas";
-import type { ArchiveConsent, ArchivedMessage, ContentBrief, ContentOutcome, ConversationInsight, Customer, Draft, EvaluationCandidate, GenerationRun, Proof, PublicationRecord, Role } from "../domain/types";
+import type { ArchiveConsent, ArchivedMessage, ContentBrief, ContentOutcome, ConversationInsight, Customer, Draft, EvaluationCandidate, GenerationRun, MarketingDecisionCandidate, MarketingTaskType, Proof, PublicationRecord, Role } from "../domain/types";
 import { sessionClient } from "./session-client";
 
 export class AiClientError extends Error {
@@ -11,6 +11,7 @@ export class AiClientError extends Error {
 export interface AiHealth {
   ok: boolean;
   ai_configured: boolean;
+  knowledge_configured?: boolean;
   model: string;
   fast_model: string;
   fast_model_available: boolean;
@@ -96,4 +97,9 @@ export const aiClient = {
   conversationInsights(messages: ArchivedMessage[], consents: ArchiveConsent[]) { return post<ConversationInsights>("conversation-insights", { messages, consents }); },
   contentBrief(insights: ConversationInsight[], historicalOutcomes: ContentOutcome[]) { return post<ContentBriefProposal>("content-brief", { accepted_insights: insights, historical_outcomes: historicalOutcomes }); },
   weeklyRetrospective(insights: ConversationInsight[], briefs: ContentBrief[], publications: PublicationRecord[], outcomes: ContentOutcome[]) { return post<WeeklyRetrospective>("weekly-retrospective", { insights, briefs, publications, outcomes }); },
+  async marketingCandidate(taskType: MarketingTaskType, subjectId: string, subjectRevision: number, query: string, payload: Record<string, unknown>, market = "china") {
+    const csrf = await sessionClient.writeHeaders();
+    const response = await fetch("/api/v2/marketing/candidates/generate", { method: "POST", credentials: "same-origin", headers: { "content-type": "application/json", ...csrf }, body: JSON.stringify({ task_type: taskType, subject_id: subjectId, subject_revision: subjectRevision, query, payload, market, idempotency_key: `${taskType}-${subjectId}-${subjectRevision}-${crypto.randomUUID()}` }) });
+    return readResponse<{ candidate: MarketingDecisionCandidate }>(response);
+  },
 };

@@ -52,28 +52,41 @@ describe("evaluation candidate decisions", () => {
 });
 
 describe("AI version governance", () => {
-  it("lets operations create candidates but reserves release and rollback for the lead", async () => {
+  it("creates an atomic marketing-brain candidate when knowledge or code hashes change", async () => {
+    const initial = createFixtureState();
+    const published = initial.marketing_brain_versions.find((item) => item.status === "published")!;
+    const nextPack = { ...initial.knowledge_pack_versions[0], id: "knowledge-next", name: "private-pack-next", status: "active" as const };
+    const hashes = { weekly_strategy: "code-weekly-next", content_brief: "code-brief-next", content_draft: "code-draft-next", customer_nba: "code-nba-next" };
+    const client = new StateDataClient({ initialState: initial });
+
+    const synced = await client.syncKnowledgeCatalog([nextPack], initial.knowledge_sources, initial.knowledge_retrieval_runs, hashes);
+    expect(synced.marketing_brain_versions.find((item) => item.id === published.id)).toMatchObject({ status: "published", knowledge_pack_version_id: published.knowledge_pack_version_id, prompt_hashes: published.prompt_hashes });
+    expect(synced.marketing_brain_versions).toEqual(expect.arrayContaining([expect.objectContaining({ status: "draft", knowledge_pack_version_id: nextPack.id, prompt_hashes: hashes })]));
+    expect(synced.marketing_candidates.some((item) => item.status === "stale")).toBe(true);
+  });
+
+  it("evaluates a code-bound marketing brain and reserves release and rollback for the lead", async () => {
     const client = new StateDataClient({ initialState: createFixtureState() });
-    const created = await client.createPromptVersion("customer-eval-v2.1.0-rc2", "增加证据冲突切片");
-    expect(created.prompt_versions.at(-1)).toMatchObject({ name: "customer-eval-v2.1.0-rc2", status: "draft", created_by: "林澈" });
-    const prompt = created.prompt_versions.find((item) => item.id === "prompt-v2.1-rc1")!;
-    const router = created.router_versions.find((item) => item.id === "router-v2.1-rc1")!;
-    await client.runGoldenEvaluation(prompt.id, router.id, "holdout");
-    await expect(client.promoteAiVersion("prompt", prompt.id, prompt.revision)).rejects.toMatchObject({ status: 403, code: "FORBIDDEN" });
+    const state = await client.getState();
+    const brain = state.marketing_brain_versions.find((item) => item.id === "brain-v2.2-rc2")!;
+    const router = state.router_versions.find((item) => item.id === "router-v2.1-rc1")!;
+    expect(brain.prompt_hashes).toMatchObject({ weekly_strategy: expect.stringContaining("code-") });
+    await client.runGoldenEvaluation(brain.id, router.id, "holdout");
+    await expect(client.promoteAiVersion("brain", brain.id, brain.revision)).rejects.toMatchObject({ status: 403, code: "FORBIDDEN" });
 
     await client.setRole("lead");
-    const promoted = await client.promoteAiVersion("prompt", prompt.id, prompt.revision);
-    expect(promoted.prompt_versions.find((item) => item.id === prompt.id)?.status).toBe("published");
-    const previous = promoted.prompt_versions.find((item) => item.id === "prompt-v2.0")!;
+    const promoted = await client.promoteAiVersion("brain", brain.id, brain.revision);
+    expect(promoted.marketing_brain_versions.find((item) => item.id === brain.id)?.status).toBe("published");
+    const previous = promoted.marketing_brain_versions.find((item) => item.id === "brain-v2.2-published")!;
     expect(previous.status).toBe("archived");
-    const rolledBack = await client.rollbackAiVersion("prompt", previous.id, previous.revision);
-    expect(rolledBack.prompt_versions.find((item) => item.id === previous.id)?.status).toBe("published");
-    expect(rolledBack.prompt_versions.find((item) => item.id === prompt.id)?.status).toBe("archived");
+    const rolledBack = await client.rollbackAiVersion("brain", previous.id, previous.revision);
+    expect(rolledBack.marketing_brain_versions.find((item) => item.id === previous.id)?.status).toBe("published");
+    expect(rolledBack.marketing_brain_versions.find((item) => item.id === brain.id)?.status).toBe("archived");
   });
 
   it("blocks release before a qualifying locked Holdout run", async () => {
     const client = new StateDataClient({ initialState: { ...createFixtureState(), role: "lead" } });
-    const prompt = (await client.getState()).prompt_versions.find((item) => item.id === "prompt-v2.1-rc1")!;
-    await expect(client.promoteAiVersion("prompt", prompt.id, prompt.revision)).rejects.toMatchObject({ code: "QUALITY_GATE_BLOCKED" });
+    const brain = (await client.getState()).marketing_brain_versions.find((item) => item.id === "brain-v2.2-rc2")!;
+    await expect(client.promoteAiVersion("brain", brain.id, brain.revision)).rejects.toMatchObject({ code: "QUALITY_GATE_BLOCKED" });
   });
 });

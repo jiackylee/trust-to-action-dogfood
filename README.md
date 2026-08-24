@@ -1,8 +1,8 @@
-# Trust-to-Action Dogfood V2.1
+# Trust-to-Action Dogfood V2.2
 
-面向运营、销售和负责人的内部增长副驾 Dogfood。2.1 以“首稿有效采用率”为 North Star，聚焦客户状态与下一最佳动作质量，并使用 React、TypeScript、Vite、Zod、Lucide、Express、OpenAI Responses API 和 SQLite 构建本地企业试点边界。
+面向运营、销售和负责人的企微营销大脑 Dogfood。2.2 将项目 SKILLS、精选理论和企业事实接入周策略、内容 Brief、朋友圈草稿与客户 NBA，以四类输出的“决策有效采用率”作为 North Star。
 
-当前产品、AI 路由、评测门禁、数据安全和验收标准见 [2.1 AI 质量优化产品方案](docs/Trust-to-Action_2.1_AI质量优化产品方案.md)。2.0 内容运营闭环和更早方案已移入 `docs/archive/`，仅作历史参考。
+当前产品、知识架构、AI 契约、评测门禁和验收标准见 [2.2 营销大脑知识增强产品方案](docs/Trust-to-Action_2.2_营销大脑知识增强产品方案.md)。2.1 及更早方案已移入 `docs/archive/`，仅作历史参考。
 
 ## 本地运行
 
@@ -14,9 +14,17 @@ npm run dev
 
 访问 `http://127.0.0.1:4174/`。BFF 运行在 `127.0.0.1:4175`，Vite 将 `/api` 代理至 BFF。
 
-默认 `VITE_DATA_MODE=http`。BFF 使用 `better-sqlite3`、WAL 和迁移文件将合成租户状态写入 `./data/trust-to-action-v2.1.sqlite`。首次启动自动装载 fixture V5；“重置演示数据”由服务端执行。
+默认 `VITE_DATA_MODE=http`。BFF 使用 `better-sqlite3`、WAL、FTS5 `trigram` 和迁移文件将合成租户状态与知识索引写入 `./data/trust-to-action-v2.2.sqlite`。首次启动自动装载 fixture V7；“重置演示数据”由服务端执行。
 
-不配置 `OPENAI_API_KEY` 时，页面、候选审阅、质量中心和合成数据仍可评审，但真实 AI 生成会返回 `AI_NOT_CONFIGURED`，不会使用 Mock AI。
+2.2 的四类生成必须挂载私有知识包：
+
+```bash
+KNOWLEDGE_PACK_PATH=/absolute/path/to/private-knowledge-pack
+```
+
+目录需包含四套选定 SKILL 及五份最终 Markdown 资料。BFF 只读扫描允许来源，排除书籍、旧迭代与重复资料，并在首次启动建立索引和激活初始版本。未配置、未索引或未激活时返回 `KNOWLEDGE_NOT_CONFIGURED`，不会静默退化为通用 Prompt。私有知识正文、原始书籍和本机绝对路径不得提交到 Git。
+
+不配置 `OPENAI_API_KEY` 时，页面、已有候选审阅、质量中心和合成数据仍可评审，但真实 AI 生成会返回 `AI_NOT_CONFIGURED`，不会使用 Mock AI。
 
 本地 Dogfood 提供两种配置方式：
 
@@ -44,14 +52,16 @@ RUN_LIVE_OPENAI_TEST=1 npm run test:live
 
 ## 数据边界
 
-- 默认 HTTP + SQLite；Mock 模式只用于隔离单元测试和离线演示，命名空间为 `trust-to-action-dogfood-v2-1`。
+- 默认 HTTP + SQLite；Mock 模式只用于隔离单元测试和离线演示，命名空间为 `trust-to-action-dogfood-v2-2`。
 - 演示身份由 BFF 签发 HttpOnly、SameSite=Strict 的签名会话，写请求校验 CSRF Token；服务端决定角色、租户和销售客户范围。
 - `SESSION_SECRET` 在非开发环境必须配置。开发环境缺失时使用启动期临时密钥，并在健康状态中提示重启后会话失效。
 - 所有版本化写入检查对象 revision 和 Repository revision，409 冲突不覆盖最新状态。
 - 不接真实企微、V1、`landing-page`、Firestore、Cloud Run 或 `leads`。
 - 所有发布、私聊、客服回复和 Offer 发送均由人执行。
 - 会话存档、朋友圈互动和业务结果全部为确定性合成数据：36 个会话、252 条消息、12 个洞察、8 个 Brief、8 个历史发布和 6 个业务结果。
-- AI 质量数据包含 200 条纯合成黄金集（160 条调优集、40 条锁定 Holdout），不会上传真实客户内容。
+- AI 质量数据包含 440 条纯合成黄金集（352 条调优集、88 条锁定 Holdout），覆盖策略、Brief、草稿和 NBA。CI 只运行确定性检索、Mock OpenAI 合约和固定回放。
+- 完整 88 条真实 OpenAI Holdout 必须由负责人在质量中心显式确认 API 用量，最大并发 2；逐案例状态、token、response ID 和幂等键写入 SQLite，支持暂停与断点续跑。CI 和默认本地测试不会产生该用量。
+- Prompt 使用代码内类型化 builder 与内容哈希版本化；知识包、企业事实、模型路由或确定性策略变化会让待审候选过期。
 - 运营只查看聚类和脱敏引用；销售仅可按审计用途查看本人合成会话原文，负责人可按需查看全部。
 - 发布后结果固定按 7 天时间窗口关联，平台互动与销售业务结果分层展示，不宣称因果。
 
