@@ -3,10 +3,11 @@ import { Activity, AlertTriangle, CheckCircle2, Database, Eye, EyeOff, FileClock
 import { InlineAlert, LoadingState, Modal, SectionHeader, StatusBadge } from "../components/UI";
 import { aiClient } from "../data/ai-client";
 import { useAppStore } from "../store/AppStore";
+import { can } from "../domain/permissions";
 
 const SOURCE_LABELS = {
   environment: "服务端环境变量",
-  runtime: "本次 BFF 会话",
+  runtime: "本次本地服务会话",
   none: "未配置",
 } as const;
 
@@ -23,6 +24,8 @@ export function Governance() {
   const [clearError, setClearError] = useState<{ code: string; message: string } | null>(null);
 
   if (loading || !state) return <LoadingState />;
+  const currentRole = state.role;
+  const canConfigure = can(currentRole, "configure_ai");
 
   function openConfiguration() {
     setModel(health?.model && health.model !== "不可用" ? health.model : "gpt-5.6");
@@ -43,12 +46,12 @@ export function Governance() {
     setSubmitting(true);
     setConfigError(null);
     try {
-      const configuration = await aiClient.configure(apiKey, model);
+      const configuration = await aiClient.configure(apiKey, model, currentRole);
       await refreshHealth();
       setApiKey("");
       setShowKey(false);
       setConfigOpen(false);
-      notify({ title: "AI 已配置", detail: `${configuration.model} 已通过验证并仅在当前 BFF 会话内启用。`, tone: "success" });
+      notify({ title: "AI 已配置", detail: `${configuration.model} 已通过验证并仅在当前本地服务会话内启用。`, tone: "success" });
     } catch (error) {
       const problem = explainError(error);
       setConfigError({ code: problem.code, message: problem.message });
@@ -61,7 +64,7 @@ export function Governance() {
     setClearing(true);
     setClearError(null);
     try {
-      const configuration = await aiClient.clearRuntimeConfiguration();
+      const configuration = await aiClient.clearRuntimeConfiguration(currentRole);
       await refreshHealth();
       setClearOpen(false);
       notify({
@@ -79,16 +82,16 @@ export function Governance() {
 
   return <>
     <SectionHeader eyebrow="治理工作域" title="数据接入与审计" description="当前全部为合成、脱敏数据；接口状态用于验证无权限、延迟和部分失败体验。" actions={<button className="secondary-button" onClick={() => notify({ title: "已发起模拟重试", detail: "游标未变化，未写入任何生产数据。", tone: "info" })}><RefreshCw />重试异常源</button>} />
-    <InlineAlert tone="info" title="独立中国区数据面边界">正式版不会复用东京 `leads` 数据库；本地 V2 只写入浏览器的 `trust-to-action-dogfood-v2` 命名空间。</InlineAlert>
+    <InlineAlert tone="info" title="独立中国区数据面边界">正式版不会复用东京客户数据库；本地 V2 仅保存合成演示数据。<details className="technical-details"><summary>技术详情</summary><code>trust-to-action-dogfood-v2</code></details></InlineAlert>
     <div className="governance-grid">
       {state.integrations.map((source) => <section className="integration-row" key={source.id}><div className={`integration-icon integration-${source.status}`}><Database /></div><div className="integration-main"><div><h2>{source.name}</h2><StatusBadge status={source.status} /></div><p>{source.description}</p><dl><div><dt>权限范围</dt><dd>{source.scope}</dd></div><div><dt>最近成功</dt><dd>{source.last_success_at ? formatDate(source.last_success_at) : "从未成功"}</dd></div><div><dt>游标状态</dt><dd><code>{source.cursor}</code></dd></div><div><dt>数据时效</dt><dd>{source.freshness}</dd></div></dl>{source.error && <span className="integration-error"><AlertTriangle />{source.error}</span>}</div><button className="icon-button" aria-label={`重试 ${source.name}`} title="模拟重试" onClick={() => notify({ title: `${source.name} 已加入重试队列`, detail: "演示环境不会请求真实企微接口。", tone: "info" })}><RefreshCw /></button></section>)}
     </div>
     <div className="governance-lower">
       <section className="panel ai-config-panel">
-        <div className="panel-heading"><div><span className="eyebrow">AI BFF</span><h2>本地模型配置</h2></div>{health?.ai_configured ? <CheckCircle2 className="success-text" /> : <KeyRound className="warning-text" />}</div>
+        <div className="panel-heading"><div><span className="eyebrow">AI 服务</span><h2>本地模型配置</h2></div>{health?.ai_configured ? <CheckCircle2 className="success-text" /> : <KeyRound className="warning-text" />}</div>
         <div className={`ai-config-status ${health?.ai_configured ? "configured" : "unconfigured"}`}>
           <span className="config-mark">{health?.ai_configured ? <CheckCircle2 /> : <KeyRound />}</span>
-          <span><strong>{health?.ai_configured ? "AI 已就绪" : "等待 API Key"}</strong><small>{health?.ok ? "本地 BFF 正常运行" : "本地 BFF 当前不可用"}</small></span>
+          <span><strong>{health?.ai_configured ? "AI 已就绪" : "等待 API Key"}</strong><small>{health?.ok ? "本地 AI 服务正常运行" : "本地 AI 服务当前不可用"}</small></span>
         </div>
         <dl className="key-values">
           <div><dt>模型</dt><dd><code>{health?.model ?? "检查中"}</code></dd></div>
@@ -97,10 +100,10 @@ export function Governance() {
           <div><dt>敏感日志</dt><dd>不记录密钥、完整提示词、客户片段或模型正文</dd></div>
         </dl>
         <div className="ai-config-actions">
-          <button className="primary-button" onClick={openConfiguration}><KeyRound />{health?.ai_configured ? "重新配置" : "配置 API Key"}</button>
-          {health?.config_source === "runtime" && <button className="secondary-button" onClick={() => { setClearError(null); setClearOpen(true); }}><Trash2 />清除会话密钥</button>}
+          <button className="primary-button" onClick={openConfiguration} disabled={!canConfigure} title={!canConfigure ? "只有运营或负责人可以配置" : undefined}><KeyRound />{health?.ai_configured ? "重新配置" : "配置 API Key"}</button>
+          {health?.config_source === "runtime" && <button className="secondary-button" disabled={!canConfigure} onClick={() => { setClearError(null); setClearOpen(true); }}><Trash2 />清除会话密钥</button>}
         </div>
-        <p className="config-footnote">页面提交的密钥只保存在本机 BFF 进程内存中，BFF 重启后自动清除。长期配置仍使用本地 <code>.env</code>。</p>
+        <p className="config-footnote">页面提交的密钥只保存在本机服务进程内存中，服务重启后自动清除。长期配置仍使用本地环境文件。</p>
       </section>
       <section className="panel audit-panel"><div className="panel-heading"><div><span className="eyebrow">最近事件</span><h2>审计日志</h2></div><ShieldCheck /></div><div className="audit-list">{state.audits.slice(0, 8).map((event) => <div key={event.id}><span className={`audit-source source-${event.source}`}>{event.source === "ai" ? <Activity /> : event.source === "system" ? <FileClock /> : <ShieldCheck />}</span><span><strong>{event.action}</strong><small>{event.actor} · {formatDate(event.at)}</small><p>{event.detail}</p></span></div>)}</div></section>
     </div>
@@ -118,12 +121,12 @@ export function Governance() {
           <button className="icon-button" type="button" onClick={() => setShowKey((value) => !value)} aria-label={showKey ? "隐藏 API Key" : "显示 API Key"} title={showKey ? "隐藏 API Key" : "显示 API Key"}>{showKey ? <EyeOff /> : <Eye />}</button>
         </div>
         <label htmlFor="openai-model"><span>模型</span><input id="openai-model" type="text" value={model} onChange={(event) => setModel(event.target.value)} pattern="[a-zA-Z0-9._-]+" maxLength={80} required /></label>
-        {configError && <InlineAlert tone="danger" title={configError.code}>{configError.message} 密钥和模型输入已保留，可直接修正后重试。</InlineAlert>}
+        {configError && <InlineAlert tone="danger" title="配置未完成">{configError.message} 密钥和模型输入已保留，可直接修正后重试。<details className="technical-details"><summary>技术详情</summary><code>{configError.code}</code></details></InlineAlert>}
         <ul className="config-safety-list" id="api-key-safety">
-          <li>仅提交至 <code>127.0.0.1</code> 上的本地 BFF。</li>
+          <li>仅提交至本机运行的 AI 服务。</li>
           <li>仅保存在服务进程内存，不写入浏览器存储、审计日志或响应。</li>
           <li>新配置验证成功前，现有可用配置不会被替换。</li>
-          <li>BFF 重启会清除页面配置的会话密钥。</li>
+          <li>本地服务重启会清除页面配置的会话密钥。</li>
         </ul>
       </form>
     </Modal>
@@ -134,8 +137,8 @@ export function Governance() {
       onClose={() => !clearing && setClearOpen(false)}
       actions={<><button className="secondary-button" type="button" onClick={() => setClearOpen(false)} disabled={clearing}>取消</button><button className="danger-button" type="button" onClick={() => void clearRuntimeConfiguration()} disabled={clearing}>{clearing ? "正在清除…" : "确认清除"}</button></>}
     >
-      <p>清除后，当前 BFF 会话中的 API Key 会立即从内存移除。若未配置 <code>.env</code>，所有 AI 生成将被阻断。</p>
-      {clearError && <InlineAlert tone="danger" title={clearError.code}>{clearError.message}</InlineAlert>}
+      <p>清除后，当前本地服务会话中的 API Key 会立即从内存移除。若没有长期配置，所有 AI 生成将被阻断。</p>
+      {clearError && <InlineAlert tone="danger" title="清除未完成">{clearError.message}<details className="technical-details"><summary>技术详情</summary><code>{clearError.code}</code></details></InlineAlert>}
     </Modal>
   </>;
 }

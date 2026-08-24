@@ -39,7 +39,7 @@ export function LoadingState() {
 
 export function InlineAlert({ tone = "warning", title, children }: { tone?: ToastTone; title: string; children?: ReactNode }) {
   const Icon = tone === "danger" ? AlertCircle : tone === "success" ? CheckCircle2 : tone === "info" ? Info : TriangleAlert;
-  return <div className={`inline-alert alert-${tone}`}><Icon size={18} /><div><strong>{title}</strong>{children && <div>{children}</div>}</div></div>;
+  return <div className={`inline-alert alert-${tone}`} role={tone === "danger" ? "alert" : "status"} aria-live={tone === "danger" ? "assertive" : "polite"}><Icon size={18} /><div><strong>{title}</strong>{children && <div>{children}</div>}</div></div>;
 }
 
 export function Modal({ open, title, children, onClose, actions }: { open: boolean; title: string; children: ReactNode; onClose(): void; actions?: ReactNode }) {
