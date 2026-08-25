@@ -5,6 +5,11 @@ export type Status = "pending" | "ready" | "review" | "approved" | "returned" | 
 export type PublicationChannel = "朋友圈" | "销售" | "官网" | "仅内部";
 export type ApprovalStatus = "not_required" | "required" | "pending" | "approved" | "returned";
 export type MarketingTaskType = "weekly_strategy" | "content_brief" | "content_draft" | "customer_nba";
+export type AiProviderId = "openai" | "deepseek" | "anthropic" | "qwen" | "custom";
+export type AiProtocol = "openai_responses" | "openai_chat" | "anthropic_messages";
+export type AiEndpointScope = "public_cloud" | "private";
+export type AiCredentialSource = "environment" | "runtime" | "none";
+export type ModelProfileStatus = "draft" | "connection_verified" | "trial_ready" | "enterprise_ready" | "active" | "archived" | "credential_missing";
 export type KnowledgeKind = "hard_guardrail" | "operating_principle" | "verified_experience" | "experience_baseline" | "theory" | "test_hypothesis" | "prohibited_action";
 export type KnowledgeSourceStatus = "ready" | "duplicate" | "unresolved" | "excluded" | "error";
 export type TenantFactType = "product_truth" | "expert_position" | "brand_voice" | "offer_definition";
@@ -140,6 +145,7 @@ export interface MarketingBrainVersionCore {
   knowledge_pack_version_id: string;
   tenant_fact_version_id: string;
   model_router_version_id: string;
+  model_profile_version_id?: string;
   policy_version: string;
   created_by: string;
   published_by: string | null;
@@ -203,18 +209,27 @@ export type EvaluationDecisionKind = "accepted" | "modified" | "rejected";
 export type EvaluationReasonCode = "wrong_state" | "wrong_evidence" | "wrong_nba" | "missing_context" | "risk_compliance" | "too_generic" | "other";
 export type EvaluationReviewOutcome = "retained" | "quality_reversal" | "new_evidence";
 
-export interface ModelAttempt {
+export interface ProviderAttempt {
+  provider?: AiProviderId;
+  protocol?: AiProtocol;
+  endpoint_scope?: AiEndpointScope;
   model: string;
   status: "success" | "failed" | "escalated";
   latency_ms: number;
   response_id: string | null;
   error_code: string | null;
 }
+export type ModelAttempt = ProviderAttempt;
 
 export interface GenerationRunCore {
   task: "customer_evaluation";
   subject_id: string;
   status: "success" | "blocked" | "failed";
+  provider?: AiProviderId;
+  protocol?: AiProtocol;
+  connection_profile_id?: string;
+  model_profile_version_id?: string;
+  endpoint_scope?: AiEndpointScope;
   model: string;
   prompt_version: string;
   router_version: string;
@@ -285,6 +300,57 @@ export interface RouterVersionCore {
   published_at: string | null;
 }
 export type RouterVersion = Versioned<RouterVersionCore>;
+
+export interface ProviderCapability {
+  structured_output: boolean;
+  native_json_schema: boolean;
+  refusal_signal: boolean;
+  usage_reporting: boolean;
+  request_id: boolean;
+  tested_at: string | null;
+  notes: string[];
+}
+
+export interface ProviderConnectionProfileCore {
+  tenant_id: string;
+  name: string;
+  provider: AiProviderId;
+  endpoint_scope: AiEndpointScope;
+  protocol: AiProtocol;
+  base_url: string;
+  region: string;
+  auth_mode: "bearer" | "x-api-key" | "none";
+  credential_source: AiCredentialSource;
+  credential_ref: string | null;
+  credential_available: boolean;
+  capabilities: ProviderCapability;
+  last_tested_at: string | null;
+  last_error_code: string | null;
+  created_by: string;
+}
+export type ProviderConnectionProfile = Versioned<ProviderConnectionProfileCore>;
+
+export interface ModelProfileVersionCore {
+  tenant_id: string;
+  name: string;
+  connection_profile_id: string;
+  provider: AiProviderId;
+  protocol: AiProtocol;
+  endpoint_scope: AiEndpointScope;
+  primary_model: string;
+  fallback_model: string | null;
+  status: ModelProfileStatus;
+  smoke_passed_at: string | null;
+  smoke_case_count: number;
+  holdout_run_id: string | null;
+  data_egress_acknowledged_by: string | null;
+  data_egress_acknowledged_at: string | null;
+  activated_by: string | null;
+  activated_at: string | null;
+  previous_profile_id: string | null;
+  created_by: string;
+}
+export type ModelProfileVersion = Versioned<ModelProfileVersionCore>;
 
 export interface GoldenCaseCore {
   task_type: MarketingTaskType;
@@ -361,6 +427,7 @@ export interface EvalScore {
 
 export interface EvalRunCore {
   marketing_brain_version_id: string;
+  model_profile_version_id?: string;
   prompt_version_id?: string;
   router_version_id: string;
   split: "development" | "holdout";
@@ -416,6 +483,28 @@ export interface AiQualityMetrics {
   forbidden_source_hits: number;
   unsupported_facts: number;
   retrieval_hit_rate: number;
+  provider_slices: Record<string, {
+    runs: number;
+    success_rate: number;
+    fallback_rate: number;
+    p95_latency_ms: number;
+    input_tokens: number;
+    output_tokens: number;
+  }>;
+  profile_slices: Record<string, {
+    profile_id: string;
+    profile_name: string;
+    provider: AiProviderId;
+    protocol: AiProtocol;
+    endpoint_scope: AiEndpointScope;
+    model: string;
+    runs: number;
+    success_rate: number;
+    fallback_rate: number;
+    p95_latency_ms: number;
+    input_tokens: number;
+    output_tokens: number;
+  }>;
 }
 
 export interface CustomerCore {
@@ -707,6 +796,8 @@ export interface DomainState {
   evaluation_decisions: EvaluationDecision[];
   prompt_versions: PromptVersion[];
   router_versions: RouterVersion[];
+  provider_connections: ProviderConnectionProfile[];
+  model_profiles: ModelProfileVersion[];
   golden_cases: GoldenCase[];
   eval_runs: EvalRun[];
   knowledge_pack_versions: KnowledgePackVersion[];

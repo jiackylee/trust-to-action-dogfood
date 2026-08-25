@@ -1,5 +1,5 @@
 import type { AiResult, ContentBriefProposal, ContentDraftProposal, ConversationInsights, CustomerEvaluation, RiskReview, WeeklyRetrospective, WeeklyStrategy } from "../domain/schemas";
-import type { ArchiveConsent, ArchivedMessage, ContentBrief, ContentOutcome, ConversationInsight, Customer, Draft, EvaluationCandidate, GenerationRun, MarketingDecisionCandidate, MarketingTaskType, Proof, PublicationRecord, Role } from "../domain/types";
+import type { AiEndpointScope, AiProtocol, AiProviderId, ArchiveConsent, ArchivedMessage, ContentBrief, ContentOutcome, ConversationInsight, Customer, DomainState, Draft, EvaluationCandidate, GenerationRun, MarketingDecisionCandidate, MarketingTaskType, Proof, PublicationRecord, Role } from "../domain/types";
 import { sessionClient } from "./session-client";
 
 export class AiClientError extends Error {
@@ -12,7 +12,13 @@ export interface AiHealth {
   ok: boolean;
   ai_configured: boolean;
   knowledge_configured?: boolean;
+  provider: AiProviderId;
+  protocol: AiProtocol;
+  endpoint_scope: AiEndpointScope;
+  connection_profile_id: string;
+  model_profile_version_id: string;
   model: string;
+  fallback_model: string | null;
   fast_model: string;
   fast_model_available: boolean;
   data_mode: string;
@@ -23,7 +29,13 @@ export interface AiHealth {
 
 export interface AiConfiguration {
   configured: boolean;
+  provider: AiProviderId;
+  protocol: AiProtocol;
+  endpoint_scope: AiEndpointScope;
+  connection_profile_id: string;
+  model_profile_version_id: string;
   model: string;
+  fallback_model: string | null;
   fast_model: string;
   fast_model_available: boolean;
   source: AiHealth["config_source"];
@@ -84,6 +96,46 @@ export const aiClient = {
       headers: { "x-tta-local-config": "1", ...csrf },
     });
     return readResponse<AiConfiguration>(response);
+  },
+  async createConnection(input: { name: string; provider: AiProviderId; endpoint_scope: AiEndpointScope; protocol: AiProtocol; base_url: string; region: string; auth_mode: "bearer" | "x-api-key" | "none"; credential_ref: string | null }) {
+    const csrf = await sessionClient.writeHeaders();
+    const response = await fetch("/api/v2/ai/connections", { method: "POST", credentials: "same-origin", headers: { "content-type": "application/json", "x-tta-local-config": "1", ...csrf }, body: JSON.stringify(input) });
+    return readResponse<DomainState>(response);
+  },
+  async createModelProfile(input: { name: string; connection_profile_id: string; primary_model: string; fallback_model: string | null }) {
+    const csrf = await sessionClient.writeHeaders();
+    const response = await fetch("/api/v2/ai/model-profiles", { method: "POST", credentials: "same-origin", headers: { "content-type": "application/json", "x-tta-local-config": "1", ...csrf }, body: JSON.stringify(input) });
+    return readResponse<DomainState>(response);
+  },
+  async testConnection(connectionId: string, profileId: string, apiKey: string, expectedRevision: number) {
+    const csrf = await sessionClient.writeHeaders();
+    const response = await fetch(`/api/v2/ai/connections/${connectionId}/test`, { method: "POST", credentials: "same-origin", headers: { "content-type": "application/json", "x-tta-local-config": "1", ...csrf }, body: JSON.stringify({ profile_id: profileId, api_key: apiKey || undefined, expected_revision: expectedRevision }) });
+    return readResponse<DomainState>(response);
+  },
+  async clearConnectionSecret(connectionId: string) {
+    const csrf = await sessionClient.writeHeaders();
+    const response = await fetch(`/api/v2/ai/connections/${connectionId}/runtime-secret`, { method: "DELETE", credentials: "same-origin", headers: { "x-tta-local-config": "1", ...csrf } });
+    return readResponse<DomainState>(response);
+  },
+  async runProfileSmoke(profileId: string, expectedRevision: number) {
+    const csrf = await sessionClient.writeHeaders();
+    const response = await fetch(`/api/v2/ai/model-profiles/${profileId}/smoke`, { method: "POST", credentials: "same-origin", headers: { "content-type": "application/json", "x-tta-local-config": "1", ...csrf }, body: JSON.stringify({ expected_revision: expectedRevision }) });
+    return readResponse<DomainState>(response);
+  },
+  async activateProfile(profileId: string, expectedRevision: number, dataEgressAcknowledged: boolean) {
+    const csrf = await sessionClient.writeHeaders();
+    const response = await fetch(`/api/v2/ai/model-profiles/${profileId}/activate`, { method: "POST", credentials: "same-origin", headers: { "content-type": "application/json", "x-tta-local-config": "1", ...csrf }, body: JSON.stringify({ expected_revision: expectedRevision, data_egress_acknowledged: dataEgressAcknowledged }) });
+    return readResponse<DomainState>(response);
+  },
+  async rollbackProfile(profileId: string) {
+    const csrf = await sessionClient.writeHeaders();
+    const response = await fetch(`/api/v2/ai/model-profiles/${profileId}/rollback`, { method: "POST", credentials: "same-origin", headers: { "content-type": "application/json", "x-tta-local-config": "1", ...csrf }, body: "{}" });
+    return readResponse<DomainState>(response);
+  },
+  async runProfileHoldout(profileId: string) {
+    const csrf = await sessionClient.writeHeaders();
+    const response = await fetch(`/api/v2/ai/model-profiles/${profileId}/holdout`, { method: "POST", credentials: "same-origin", headers: { "content-type": "application/json", ...csrf }, body: JSON.stringify({ usage_confirmed: true, idempotency_key: `profile-holdout-${profileId}-${crypto.randomUUID()}` }) });
+    return readResponse<DomainState>(response);
   },
   weeklyStrategy(input: unknown) { return post<WeeklyStrategy>("weekly-strategy", input); },
   contentDraft(strategy: WeeklyStrategy, proofs: Proof[], stage: string, brief?: ContentBrief, acceptedInsights?: ConversationInsight[], historicalOutcomes?: ContentOutcome[]) { return post<ContentDraftProposal>("content-draft", { strategy, proofs, stage, brief, accepted_insights: acceptedInsights ?? [], historical_outcomes: historicalOutcomes ?? [] }); },

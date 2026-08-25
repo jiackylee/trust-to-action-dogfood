@@ -97,7 +97,7 @@ export function AppStore({ children }: { children: ReactNode }) {
     try {
       setHealth(await aiClient.health());
     } catch {
-      setHealth({ ok: false, ai_configured: false, knowledge_configured: false, model: "不可用", fast_model: "不可用", fast_model_available: false, data_mode: "unavailable", session_warning: null, config_source: "none", configured_at: null });
+      setHealth({ ok: false, ai_configured: false, knowledge_configured: false, provider: "openai", protocol: "openai_responses", endpoint_scope: "public_cloud", connection_profile_id: "unavailable", model_profile_version_id: "unavailable", model: "不可用", fallback_model: null, fast_model: "不可用", fast_model_available: false, data_mode: "unavailable", session_warning: null, config_source: "none", configured_at: null });
     }
   }, []);
 

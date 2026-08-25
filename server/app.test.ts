@@ -4,6 +4,7 @@ import type { Server } from "node:http";
 import { createFixtureState } from "../src/domain/fixtures";
 import type { AiService } from "./ai-service";
 import { AiServiceError, createOpenAiServiceManager } from "./ai-service";
+import type { ProviderAdapter, ProviderAdapterOptions } from "./ai-adapters";
 import { createApp } from "./app";
 
 const fixture = createFixtureState();
@@ -22,6 +23,21 @@ function service(overrides: Partial<AiService> = {}): AiService {
     weeklyRetrospective: vi.fn(async () => ({ data: fixture.weekly_retrospective.retrospective, meta })),
     ...overrides,
   };
+}
+
+function multiModelManager() {
+  const calls: Array<{ provider: string; model: string }> = [];
+  const adapterFactory = (options: ProviderAdapterOptions): ProviderAdapter => ({
+    provider: options.connection.provider,
+    protocol: options.connection.protocol,
+    endpointScope: options.connection.endpoint_scope,
+    async generate<T>(input: { model: string }) {
+      calls.push({ provider: options.connection.provider, model: input.model });
+      return { data: { title: "合成 Smoke" } as T, responseId: `response-${calls.length}`, inputTokens: 5, outputTokens: 2 };
+    },
+    async verify(model) { calls.push({ provider: options.connection.provider, model }); },
+  });
+  return { manager: createOpenAiServiceManager({ adapterFactory, environment: {} }), calls };
 }
 
 const servers: Server[] = [];
@@ -121,7 +137,20 @@ describe("AI BFF contracts", () => {
 
   it("returns health without exposing a key", async () => {
     const response = await call("/api/v2/health");
-    expect(await response.json()).toMatchObject({ ok: true, ai_configured: true, model: "mock-openai", fast_model: "gpt-5.6-terra", data_mode: "http-sqlite", config_source: "environment", configured_at: null });
+    expect(await response.json()).toMatchObject({
+      ok: true,
+      ai_configured: true,
+      provider: "openai",
+      protocol: "openai_responses",
+      connection_profile_id: "connection-openai",
+      model_profile_version_id: "model-profile-openai",
+      model: "mock-openai",
+      fallback_model: null,
+      fast_model: "mock-openai",
+      data_mode: "http-sqlite",
+      config_source: "environment",
+      configured_at: null,
+    });
   });
 
   it("validates and enables an in-memory configuration without echoing the secret", async () => {
@@ -352,5 +381,83 @@ describe("AI BFF contracts", () => {
     const undone = await client.request("/api/v2/undo", { body: { snapshot: { forged: true } } });
     expect(undone.status).toBe(200);
     expect(await undone.json()).toMatchObject({ approvals: expect.arrayContaining([expect.objectContaining({ id: approval.id, status: "pending" })]) });
+  });
+
+  it("governs connection, Smoke and public-cloud activation without exposing credentials", async () => {
+    const { manager, calls } = multiModelManager();
+    const client = await openClient(manager);
+    const initial = await (await client.request("/api/v2/state")).json() as typeof fixture;
+    const connection = initial.provider_connections.find((item) => item.id === "connection-deepseek")!;
+    const profile = initial.model_profiles.find((item) => item.id === "model-profile-deepseek")!;
+    const secret = "deepseek-runtime-test-secret";
+
+    const tested = await client.request(`/api/v2/ai/connections/${connection.id}/test`, { headers: { "x-tta-local-config": "1" }, body: { profile_id: profile.id, api_key: secret, expected_revision: connection.revision } });
+    const testedText = await tested.text();
+    expect(tested.status).toBe(200);
+    expect(testedText).not.toContain(secret);
+    expect(JSON.parse(testedText)).toMatchObject({ provider_connections: expect.arrayContaining([expect.objectContaining({ id: connection.id, credential_available: true })]) });
+
+    const smoke = await client.request(`/api/v2/ai/model-profiles/${profile.id}/smoke`, { headers: { "x-tta-local-config": "1" }, body: { expected_revision: profile.revision } });
+    expect(smoke.status).toBe(200);
+    const smoked = await smoke.json() as typeof fixture;
+    const smokeProfile = smoked.model_profiles.find((item) => item.id === profile.id)!;
+    expect(smokeProfile).toMatchObject({ status: "trial_ready", smoke_case_count: 14 });
+    expect(calls.filter((item) => item.provider === "deepseek")).toHaveLength(15);
+
+    const operationsActivation = await client.request(`/api/v2/ai/model-profiles/${profile.id}/activate`, { headers: { "x-tta-local-config": "1" }, body: { expected_revision: smokeProfile.revision, data_egress_acknowledged: true } });
+    expect(operationsActivation.status).toBe(403);
+    await client.switchRole("lead");
+
+    const missingAck = await client.request(`/api/v2/ai/model-profiles/${profile.id}/activate`, { headers: { "x-tta-local-config": "1" }, body: { expected_revision: smokeProfile.revision, data_egress_acknowledged: false } });
+    expect(missingAck.status).toBe(422);
+    expect(await missingAck.json()).toMatchObject({ error: { code: "DATA_EGRESS_ACK_REQUIRED" } });
+    expect(manager.getConfiguration().provider).toBe("openai");
+
+    const activated = await client.request(`/api/v2/ai/model-profiles/${profile.id}/activate`, { headers: { "x-tta-local-config": "1" }, body: { expected_revision: smokeProfile.revision, data_egress_acknowledged: true } });
+    expect(activated.status).toBe(200);
+    const activatedState = await activated.json() as typeof fixture;
+    expect(activatedState.model_profiles.find((item) => item.id === profile.id)).toMatchObject({ status: "active", data_egress_acknowledged_by: "周岚" });
+    expect(activatedState.marketing_candidates.filter((item) => item.status === "pending")).toHaveLength(0);
+    expect(manager.getConfiguration()).toMatchObject({ provider: "deepseek", model: "deepseek-chat", fallback_model: "deepseek-reasoner" });
+  });
+
+  it("rejects stale connection and Smoke revisions before making provider calls", async () => {
+    const { manager, calls } = multiModelManager();
+    const client = await openClient(manager);
+    const state = await (await client.request("/api/v2/state")).json() as typeof fixture;
+    const connection = state.provider_connections.find((item) => item.id === "connection-deepseek")!;
+    const profile = state.model_profiles.find((item) => item.id === "model-profile-deepseek")!;
+
+    const connectionResponse = await client.request(`/api/v2/ai/connections/${connection.id}/test`, {
+      headers: { "x-tta-local-config": "1" },
+      body: { profile_id: profile.id, api_key: "stale-revision-test-secret", expected_revision: connection.revision + 1 },
+    });
+    expect(connectionResponse.status).toBe(409);
+    expect(await connectionResponse.json()).toMatchObject({ error: { code: "VERSION_CONFLICT" } });
+
+    const smokeResponse = await client.request(`/api/v2/ai/model-profiles/${profile.id}/smoke`, {
+      headers: { "x-tta-local-config": "1" },
+      body: { expected_revision: profile.revision + 1 },
+    });
+    expect(smokeResponse.status).toBe(409);
+    expect(await smokeResponse.json()).toMatchObject({ error: { code: "VERSION_CONFLICT" } });
+    expect(calls).toEqual([]);
+  });
+
+  it("hides model connection details from sales and rejects stale Profile activation", async () => {
+    const { manager } = multiModelManager();
+    const client = await openClient(manager);
+    await client.switchRole("sales");
+    const connections = await client.request("/api/v2/ai/connections");
+    expect(connections.status).toBe(403);
+    const state = await (await client.request("/api/v2/state")).json() as typeof fixture;
+    expect(state.model_profiles).toHaveLength(1);
+    expect(state.provider_connections).toEqual([expect.objectContaining({ base_url: "已隐藏", credential_ref: null, credential_available: false })]);
+
+    await client.switchRole("lead");
+    const active = state.model_profiles[0];
+    const stale = await client.request(`/api/v2/ai/model-profiles/${active.id}/activate`, { headers: { "x-tta-local-config": "1" }, body: { expected_revision: active.revision + 10, data_egress_acknowledged: true } });
+    expect(stale.status).toBe(409);
+    expect(await stale.json()).toMatchObject({ error: { code: "VERSION_CONFLICT" } });
   });
 });

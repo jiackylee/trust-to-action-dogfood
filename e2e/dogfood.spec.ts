@@ -47,7 +47,7 @@ for (const viewport of [{ width: 1440, height: 900 }, { width: 1024, height: 768
     expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1);
     if (viewport.width === 390) {
       await expect(page.locator(".desktop-authoring")).toBeHidden();
-      await expect(page.getByText("营销脑哈希对比、黄金集管理和模型路由编辑在桌面端开放；移动端仍可查看质量指标。")).toBeVisible();
+      await expect(page.getByText("营销脑哈希对比、黄金集和模型 Profile 治理在桌面端开放；移动端仍可查看质量指标。")).toBeVisible();
       await switchRole(page, "销售");
       await page.goto("/customers");
       await page.locator(".customer-cards .mobile-card").first().getByRole("link").click();
@@ -57,6 +57,9 @@ for (const viewport of [{ width: 1440, height: 900 }, { width: 1024, height: 768
       await page.goto("/content?draft=draft-07");
       await page.getByRole("button", { name: "审阅 AI 候选" }).click();
       await expect(page.locator(".marketing-decision-panel")).toContainText("知识依据");
+      expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1);
+      await page.goto("/governance");
+      await expect(page.locator(".model-profile-row").first()).toBeVisible();
       expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1);
     }
     expect(browserErrors).toEqual([]);
@@ -146,45 +149,82 @@ test("role workspaces, role menu keyboard controls and execution tabs are access
   await expect(page.locator(".approval-context").first()).toContainText("证据");
 });
 
-test("local AI key configuration keeps the secret ephemeral", async ({ page }) => {
-  const secret = "local-playwright-secret-never-persisted";
+test("multi-model Profile verifies, smokes, activates and rolls back without persisting its secret", async ({ page }) => {
+  const secret = "deepseek-playwright-secret-never-persisted";
+  const initialState = await page.evaluate(async () => fetch("/api/v2/state").then((response) => response.json())) as any;
+  const session = await page.evaluate(async () => fetch("/api/v2/session").then((response) => response.json())) as any;
+  let state = structuredClone(initialState);
   let configured = false;
   let submittedKey = "";
+  const deepProfile = () => state.model_profiles.find((item: any) => item.id === "model-profile-deepseek");
+  const deepConnection = () => state.provider_connections.find((item: any) => item.id === "connection-deepseek");
 
-  await page.route("**/api/v2/health", async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify({ ok: true, ai_configured: configured, model: configured ? "gpt-test" : "gpt-5.6", fast_model: "gpt-5.6-terra", fast_model_available: true, data_mode: "http-sqlite", session_warning: null, config_source: configured ? "runtime" : "none", configured_at: configured ? "2026-08-23T16:00:00.000Z" : null }),
-    });
+  await page.route("**/api/v2/state", async (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(state) }));
+  await page.route("**/api/v2/session/demo", async (route) => {
+    const role = (route.request().postDataJSON() as { role: string }).role;
+    state = { ...state, role };
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ session: { ...session, role }, state }) });
   });
-  await page.route("**/api/v2/ai/config", async (route) => {
-    if (route.request().method() !== "POST") return route.fallback();
-    const body = route.request().postDataJSON() as { api_key: string; model: string };
+  await page.route("**/api/v2/health", async (route) => route.fulfill({
+    status: 200, contentType: "application/json",
+    body: JSON.stringify({ ok: true, ai_configured: configured, knowledge_configured: true, provider: configured ? "deepseek" : "openai", protocol: "openai_responses", endpoint_scope: "public_cloud", connection_profile_id: configured ? "connection-deepseek" : "connection-openai", model_profile_version_id: configured ? "model-profile-deepseek" : "model-profile-openai", model: configured ? "deepseek-chat" : "gpt-5.6", fallback_model: configured ? "deepseek-reasoner" : "gpt-5.6-terra", fast_model: configured ? "deepseek-reasoner" : "gpt-5.6-terra", fast_model_available: configured, data_mode: "http-sqlite", session_warning: null, config_source: configured ? "runtime" : "none", configured_at: configured ? "2026-08-24T10:00:00.000Z" : null }),
+  }));
+  await page.route("**/api/v2/ai/connections/connection-deepseek/test", async (route) => {
+    const body = route.request().postDataJSON() as { api_key: string };
     submittedKey = body.api_key;
+    const connection = deepConnection();
+    Object.assign(connection, { credential_source: "runtime", credential_available: true, revision: connection.revision + 1, capabilities: { structured_output: true, native_json_schema: true, refusal_signal: true, usage_reporting: true, request_id: true, tested_at: "2026-08-24T10:00:00.000Z", notes: ["Responses Structured Outputs"] } });
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(state) });
+  });
+  await page.route("**/api/v2/ai/model-profiles/model-profile-deepseek/smoke", async (route) => {
+    Object.assign(deepProfile(), { status: "trial_ready", smoke_case_count: 14, smoke_passed_at: "2026-08-24T10:01:00.000Z", revision: deepProfile().revision + 1 });
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(state) });
+  });
+  await page.route("**/api/v2/ai/model-profiles/model-profile-deepseek/activate", async (route) => {
+    const current = state.model_profiles.find((item: any) => item.status === "active" || item.status === "credential_missing");
+    if (current && current.id !== deepProfile().id) Object.assign(current, { status: "trial_ready" });
+    Object.assign(deepProfile(), { status: "active", previous_profile_id: current?.id ?? null, activated_by: "周岚", data_egress_acknowledged_by: "周岚", revision: deepProfile().revision + 1 });
+    state.marketing_candidates = state.marketing_candidates.map((item: any) => item.status === "pending" ? { ...item, status: "stale" } : item);
+    state.evaluation_candidates = state.evaluation_candidates.map((item: any) => item.status === "pending" ? { ...item, status: "stale" } : item);
     configured = true;
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify({ configured: true, model: body.model, source: "runtime", configured_at: "2026-08-23T16:00:00.000Z" }),
-    });
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(state) });
+  });
+  await page.route("**/api/v2/ai/model-profiles/model-profile-deepseek/rollback", async (route) => {
+    const previous = state.model_profiles.find((item: any) => item.id === deepProfile().previous_profile_id);
+    Object.assign(deepProfile(), { status: "trial_ready" });
+    if (previous) Object.assign(previous, { status: "active" });
+    configured = false;
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(state) });
   });
 
   await page.goto("/governance");
-  await page.getByRole("button", { name: "配置 API Key" }).click();
-  const keyInput = page.getByLabel("OpenAI API Key");
-  const submit = page.getByRole("button", { name: "验证并启用" });
-  await expect(keyInput).toBeFocused();
-  await keyInput.fill("short");
-  await expect(submit).toBeDisabled();
+  let row = page.locator(".model-profile-row").filter({ hasText: "DeepSeek 试用候选" });
+  await row.getByRole("button", { name: "验证 DeepSeek 试用候选" }).click();
+  const keyInput = page.getByLabel("API Key", { exact: true });
   await keyInput.fill(secret);
   await expect(keyInput).toHaveAttribute("type", "password");
   await page.getByRole("button", { name: "显示 API Key" }).click();
   await expect(keyInput).toHaveAttribute("type", "text");
-  await submit.click();
+  await page.getByRole("button", { name: "验证并保留会话凭据" }).click();
+  await expect(page.getByText("连接验证通过", { exact: true })).toBeVisible();
 
-  await expect(page.getByText("AI 已配置", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "清除会话密钥" })).toBeVisible();
+  row = page.locator(".model-profile-row").filter({ hasText: "DeepSeek 试用候选" });
+  await row.getByRole("button", { name: "运行 DeepSeek 试用候选 Smoke" }).click();
+  await expect(page.getByText("14 条 Smoke 全部通过", { exact: true })).toBeVisible();
+  await switchRole(page, "负责人");
+  row = page.locator(".model-profile-row").filter({ hasText: "DeepSeek 试用候选" });
+  await row.getByRole("button", { name: "激活 DeepSeek 试用候选" }).click();
+  const activation = page.getByRole("dialog", { name: "激活全局模型 Profile" });
+  const activate = activation.getByRole("button", { name: "确认激活" });
+  await expect(activate).toBeDisabled();
+  await activation.getByRole("checkbox").check();
+  await activate.click();
+  await expect(page.getByText("全局模型已切换", { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "DeepSeek · deepseek-chat" })).toBeVisible();
+  expect(state.marketing_candidates.some((item: any) => item.status === "pending")).toBe(false);
+
+  await page.getByRole("button", { name: "回滚 DeepSeek 试用候选" }).click();
+  await expect(page.getByText("模型 Profile 已回滚", { exact: true })).toBeVisible();
   expect(submittedKey).toBe(secret);
   expect(await page.evaluate((candidate) => Object.values(localStorage).some((value) => value.includes(candidate)), secret)).toBe(false);
   await expect(page.getByText(secret, { exact: true })).toHaveCount(0);
@@ -195,7 +235,7 @@ test("lead must explicitly confirm live Holdout usage", async ({ page }) => {
     await route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify({ ok: true, ai_configured: true, knowledge_configured: true, model: "gpt-5.6", fast_model: "gpt-5.6-terra", fast_model_available: true, data_mode: "http-sqlite", session_warning: null, config_source: "runtime", configured_at: "2026-08-24T10:00:00.000Z" }),
+      body: JSON.stringify({ ok: true, ai_configured: true, knowledge_configured: true, provider: "openai", protocol: "openai_responses", endpoint_scope: "public_cloud", connection_profile_id: "connection-openai", model_profile_version_id: "model-profile-openai", model: "gpt-5.6", fallback_model: "gpt-5.6-terra", fast_model: "gpt-5.6-terra", fast_model_available: true, data_mode: "http-sqlite", session_warning: null, config_source: "runtime", configured_at: "2026-08-24T10:00:00.000Z" }),
     });
   });
   await page.reload();

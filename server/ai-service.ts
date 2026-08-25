@@ -1,7 +1,5 @@
 import crypto from "node:crypto";
-import OpenAI from "openai";
-import { zodTextFormat } from "openai/helpers/zod";
-import type { z } from "zod";
+import type { ZodType } from "zod";
 import {
   ContentDraftProposalSchema,
   ContentBriefProposalSchema,
@@ -21,7 +19,8 @@ import {
   type WeeklyRetrospective,
 } from "../src/domain/schemas";
 import { validateCustomerEvaluation } from "../src/domain/policy";
-import type { Customer } from "../src/domain/types";
+import type { AiEndpointScope, AiProtocol, AiProviderId, Customer, ModelProfileVersion, ProviderCapability, ProviderConnectionProfile } from "../src/domain/types";
+import { createProviderAdapter, ProviderAdapterError, type ProviderAdapter, type ProviderAdapterOptions } from "./ai-adapters";
 import type { MarketingPromptContext } from "./prompts";
 import { buildMarketingPrompt, MARKETING_PROMPT_HASHES } from "./prompts";
 
@@ -53,22 +52,38 @@ export type AiConfigurationSource = "environment" | "runtime" | "none";
 
 export interface AiConfiguration {
   configured: boolean;
+  provider: AiProviderId;
+  protocol: AiProtocol;
+  endpoint_scope: AiEndpointScope;
+  connection_profile_id: string;
+  model_profile_version_id: string;
   model: string;
+  fallback_model: string | null;
   fast_model: string;
   fast_model_available: boolean;
   source: AiConfigurationSource;
   configured_at: string | null;
 }
 
+export interface ProfileActivationResult {
+  configuration: AiConfiguration;
+  capability?: ProviderCapability;
+}
+
 export interface ConfigurableAiService extends AiService {
   getConfiguration(): AiConfiguration;
   configure(apiKey: string, model: string): Promise<AiConfiguration>;
   resetRuntimeConfiguration(): AiConfiguration;
+  testConnection(connection: ProviderConnectionProfile, profile: ModelProfileVersion, apiKey?: string): Promise<ProviderCapability>;
+  runSmoke(connection: ProviderConnectionProfile, profile: ModelProfileVersion): Promise<{ passed: number; total: number }>;
+  activateProfile(connection: ProviderConnectionProfile, profile: ModelProfileVersion): AiConfiguration;
+  clearRuntimeSecret(connectionId: string): AiConfiguration;
 }
 
-const PROMPT_VERSION = "trust-to-action-content-loop-v2.0.0";
-const CUSTOMER_PROMPT_VERSION = "customer-eval-v2.1.0-rc1";
-const ROUTER_VERSION = "router-v2.1-risk-first";
+const PROMPT_VERSION = "trust-to-action-content-loop-v2.3.0";
+const CUSTOMER_PROMPT_VERSION = "customer-eval-v2.3.0";
+const ROUTER_VERSION = "global-profile-v2.3";
+const FALLBACK_CODES = new Set(["RATE_LIMITED", "TIMEOUT", "PROVIDER_UNAVAILABLE", "MODEL_UNAVAILABLE", "REFUSAL", "OUTPUT_TRUNCATED", "SCHEMA_INVALID", "LOW_CONFIDENCE", "MODEL_POLICY_BLOCKED"]);
 const SYSTEM_BOUNDARY = `你是 Trust-to-Action 内部增长副驾。只使用输入中明确提供的合成事实和证据引用。
 不得编造客户、原话、数据、授权、价格、结果或成交事实。点赞等弱信号不能独立支持 D1/A1。
 输出是结构化内部判断，不得声称已经发送、发布、报价或承诺。每条内容只保留一个 CTA。
@@ -77,7 +92,11 @@ const SYSTEM_BOUNDARY = `你是 Trust-to-Action 内部增长副驾。只使用�
 export interface CustomerRoute {
   model: string;
   reason: string;
-  tier: "fast" | "primary";
+  tier: "primary";
+}
+
+export function selectCustomerRoute(_input: unknown, primaryModel = "gpt-5.6", _fallbackModel = "gpt-5.6-terra"): CustomerRoute {
+  return { model: primaryModel, reason: "global_primary", tier: "primary" };
 }
 
 export interface CustomerRouteExecutionOptions {
@@ -88,207 +107,244 @@ export interface CustomerRouteExecutionOptions {
   run(model: string): Promise<AiResult<CustomerEvaluation>>;
 }
 
-export function selectCustomerRoute(input: unknown, primaryModel = "gpt-5.6", fastModel = "gpt-5.6-terra"): CustomerRoute {
-  const customer = (input as { customer?: Customer })?.customer;
-  if (!customer) return { model: primaryModel, reason: "missing_typed_context", tier: "primary" };
-  const validEvidence = customer.evidence.filter((item) => item.valid);
-  const sensitive = validEvidence.some((item) => /价格|报价|合同|成交|投诉|敏感|排期/iu.test(`${item.type} ${item.text}`));
-  const hasTransaction = validEvidence.some((item) => item.transaction_fact);
-  const hasConflict = customer.evidence.some((item) => !item.valid) || new Set(validEvidence.map((item) => item.strength)).size > 2;
-  const simple = ["T0", "T1"].includes(customer.state) && !customer.anomaly && !sensitive && !hasTransaction && !hasConflict;
-  return simple
-    ? { model: fastModel, reason: "simple_t0_t1", tier: "fast" }
-    : { model: primaryModel, reason: customer.anomaly ? "customer_anomaly" : hasTransaction ? "transaction_fact" : sensitive ? "sensitive_or_commercial" : hasConflict ? "evidence_conflict" : "advanced_state", tier: "primary" };
-}
-
 export async function executeCustomerRoute({ input, primaryModel, fastModel, fastModelAvailable, run }: CustomerRouteExecutionOptions) {
-  const selected = fastModelAvailable
-    ? selectCustomerRoute(input, primaryModel, fastModel)
-    : { model: primaryModel, reason: "fast_model_unavailable", tier: "primary" as const };
-  if (selected.tier === "primary") {
+  try {
     const result = await run(primaryModel);
-    return { ...result, meta: { ...result.meta, router_version: ROUTER_VERSION, route_reason: selected.reason, attempts: 1, escalated_from: null } };
-  }
-
-  try {
-    const fast = await run(fastModel);
-    const customer = (input as { customer?: Customer }).customer;
-    const policy = customer ? validateCustomerEvaluation(customer, fast.data) : { allowed: false };
-    if (fast.data.confidence < 75) throw new AiServiceError(422, "LOW_CONFIDENCE", "轻量模型置信度低于路由门槛。", true);
-    if (!policy.allowed) throw new AiServiceError(422, "FAST_MODEL_POLICY_BLOCKED", "轻量模型输出未通过策略门禁。", true);
-    return { ...fast, meta: { ...fast.meta, router_version: ROUTER_VERSION, route_reason: selected.reason, attempts: 1, escalated_from: null } };
-  } catch {
-    const primary = await run(primaryModel);
-    return { ...primary, meta: { ...primary.meta, router_version: ROUTER_VERSION, route_reason: `${selected.reason}:escalated`, attempts: 2, escalated_from: fastModel } };
-  }
-}
-
-function mapOpenAiError(error: unknown): AiServiceError {
-  if (error instanceof AiServiceError) return error;
-  if (error instanceof OpenAI.APIError) {
-    if (error.status === 429) return new AiServiceError(429, "OPENAI_RATE_LIMITED", "模型请求过于频繁，请稍后重试。", true);
-    if (error.status === 401 || error.status === 403) return new AiServiceError(503, "OPENAI_AUTH_FAILED", "OpenAI API 密钥无效或无模型权限。", false);
-    if (error.status === 404) return new AiServiceError(422, "OPENAI_MODEL_UNAVAILABLE", "当前 API Key 无法访问所选模型。", false);
-    if (error.status && error.status >= 500) return new AiServiceError(502, "OPENAI_UNAVAILABLE", "OpenAI 服务暂时不可用。", true);
-    return new AiServiceError(502, "OPENAI_REQUEST_FAILED", "OpenAI 请求失败。", Boolean(error.status && error.status >= 500));
-  }
-  if (error instanceof Error && (error.name === "AbortError" || /timeout/iu.test(error.message))) {
-    return new AiServiceError(504, "OPENAI_TIMEOUT", "模型生成超时，当前操作已阻断。", true);
-  }
-  return new AiServiceError(502, "OPENAI_UNKNOWN_ERROR", "模型生成失败，当前操作已阻断。", true);
-}
-
-async function verifyOpenAiConfiguration(apiKey: string, model: string) {
-  const client = new OpenAI({ apiKey, timeout: 15_000, maxRetries: 0 });
-  try {
-    await client.models.retrieve(model);
+    const customer = (input as { customer?: Customer })?.customer;
+    const policy = customer ? validateCustomerEvaluation(customer, result.data) : { allowed: true };
+    if (result.data.confidence < 75) throw new AiServiceError(422, "LOW_CONFIDENCE", "主模型置信度低于门槛。", true);
+    if (!policy.allowed) throw new AiServiceError(422, "MODEL_POLICY_BLOCKED", "模型输出未通过确定性策略门禁。", true);
+    return { ...result, meta: { ...result.meta, router_version: ROUTER_VERSION, route_reason: "global_primary", attempts: 1, escalated_from: null, fallback_from: null } };
   } catch (error) {
-    throw mapOpenAiError(error);
+    if (!fastModelAvailable || !shouldFallback(error)) throw error;
+    const fallback = await run(fastModel);
+    return { ...fallback, meta: { ...fallback.meta, router_version: ROUTER_VERSION, route_reason: `global_fallback:${errorCode(error)}`, attempts: 2, escalated_from: primaryModel, fallback_from: primaryModel } };
   }
 }
 
-export function createOpenAiService(options: { apiKey?: string; model?: string; fastModel?: string; fastModelAvailable?: boolean } = {}): AiService {
-  const apiKey = options.apiKey?.trim();
-  const model = options.model?.trim() || "gpt-5.6";
-  const fastModel = options.fastModel?.trim() || "gpt-5.6-terra";
-  const fastModelAvailable = options.fastModelAvailable ?? true;
-  const client = apiKey ? new OpenAI({ apiKey, timeout: 30_000, maxRetries: 0 }) : null;
+function errorCode(error: unknown) {
+  if (error instanceof AiServiceError || error instanceof ProviderAdapterError) return error.code;
+  return "PROVIDER_REQUEST_FAILED";
+}
 
-  async function generate<T>(schema: z.ZodType<T>, schemaName: string, task: string, input: unknown, selectedModel = model, promptVersion = PROMPT_VERSION, systemPrompt = SYSTEM_BOUNDARY): Promise<AiResult<T>> {
-    if (!client) throw new AiServiceError(503, "AI_NOT_CONFIGURED", "未配置 OPENAI_API_KEY，真实模型能力已阻断。", false);
-    const requestRecord = input && typeof input === "object" && !Array.isArray(input) ? input as Record<string, unknown> : null;
-    const idempotencyKey = typeof requestRecord?.__idempotency_key === "string" ? requestRecord.__idempotency_key : undefined;
-    const modelInput = requestRecord && "__idempotency_key" in requestRecord
-      ? Object.fromEntries(Object.entries(requestRecord).filter(([key]) => key !== "__idempotency_key"))
-      : input;
-    const startedAt = Date.now();
-    try {
-      const response = await client.responses.parse({
-        model: selectedModel,
-        input: [
-          { role: "system", content: `${systemPrompt}\n\n当前任务：${task}` },
-          { role: "user", content: JSON.stringify(modelInput) },
-        ],
-        text: { format: zodTextFormat(schema, schemaName) },
-      }, idempotencyKey ? { idempotencyKey } : undefined);
-      if (!response.output_parsed) {
-        const refusal = JSON.stringify(response.output).includes("refusal");
-        throw new AiServiceError(422, refusal ? "MODEL_REFUSAL" : "MODEL_OUTPUT_INVALID", refusal ? "模型拒绝处理当前输入。" : "模型未返回可校验的结构化结果。", false);
-      }
-      const data = schema.safeParse(response.output_parsed);
-      if (!data.success) throw new AiServiceError(502, "MODEL_SCHEMA_INVALID", "模型输出未通过结构校验。", true);
-      const meta: AiMeta = {
-        model: selectedModel,
-        response_id: response.id,
-        prompt_version: promptVersion,
-        generated_at: new Date().toISOString(),
-        latency_ms: Date.now() - startedAt,
-        input_tokens: response.usage?.input_tokens ?? 0,
-        output_tokens: response.usage?.output_tokens ?? 0,
-        input_fingerprint: crypto.createHash("sha256").update(JSON.stringify(modelInput)).digest("hex").slice(0, 16),
-      };
-      return { data: data.data, meta };
-    } catch (error) {
-      throw mapOpenAiError(error);
-    }
-  }
+function shouldFallback(error: unknown) {
+  if (error instanceof AiServiceError || error instanceof ProviderAdapterError) return error.retryable && FALLBACK_CODES.has(error.code);
+  return false;
+}
 
+function asAiServiceError(error: unknown) {
+  if (error instanceof AiServiceError) return error;
+  if (error instanceof ProviderAdapterError) return new AiServiceError(error.status, error.code, error.message, error.retryable);
+  return new AiServiceError(502, "PROVIDER_REQUEST_FAILED", "模型生成失败，当前操作已阻断。", true);
+}
+
+function openAiConnection(source: AiConfigurationSource): ProviderConnectionProfile {
   return {
-    configured: Boolean(client),
-    model,
-    fastModel,
-    weeklyStrategy(input) {
-      const context = (input as { brain_context?: MarketingPromptContext }).brain_context;
-      return generate(WeeklyStrategySchema, "weekly_strategy", "根据当前经营指标、状态分布、内容和证明资产生成一周运营策略。配比总和必须为 100。", input, model, context ? `code-${MARKETING_PROMPT_HASHES.weekly_strategy}` : PROMPT_VERSION, context ? buildMarketingPrompt("weekly_strategy", context) : SYSTEM_BOUNDARY);
-    },
-    contentDraft(input) {
-      const context = (input as { brain_context?: MarketingPromptContext }).brain_context;
-      const selected = (input as { low_risk_rewrite?: boolean }).low_risk_rewrite && fastModelAvailable ? fastModel : model;
-      return generate(ContentDraftProposalSchema, "content_draft", "生成一条可人工编辑的朋友圈草稿，引用输入中存在的证据，并明确一个 CTA。", input, selected, context ? `code-${MARKETING_PROMPT_HASHES.content_draft}` : PROMPT_VERSION, context ? buildMarketingPrompt("content_draft", context) : SYSTEM_BOUNDARY);
-    },
-    riskReview(input) {
-      return generate(RiskReviewSchema, "risk_review", "检查事实、客户证明、量化承诺、价格、投诉和敏感信息风险；风险判断只是建议，不能解除确定性审批门禁。", input);
-    },
-    async customerEvaluation(input) {
-      const context = (input as { brain_context?: MarketingPromptContext }).brain_context;
-      const task = `按以下顺序完成客户评估：
-1. 仅核对按时间排序且 valid=true 的证据，逐条给出可公开的 evidence_assessment。
-2. 判断状态是否保持或最多前进一步；弱信号不能独立推动 D1/A1，C1 必须引用成交事实。
-3. 从固定动作集合选择一个下一最佳动作，并列出不建议动作与未知项。
-4. 证据不足时 decision=insufficient_evidence、state_after=state_before，不得用高置信度掩盖缺口。`;
-      return executeCustomerRoute({
-        input,
-        primaryModel: model,
-        fastModel,
-        fastModelAvailable,
-        run: (selectedModel) => generate(CustomerEvaluationSchema, "customer_evaluation", task, input, selectedModel, context ? `code-${MARKETING_PROMPT_HASHES.customer_nba}` : CUSTOMER_PROMPT_VERSION, context ? buildMarketingPrompt("customer_nba", context) : SYSTEM_BOUNDARY),
-      });
-    },
-    conversationInsights(input) {
-      return generate(ConversationInsightsSchema, "conversation_insights", "从已经过同意、权限、有效性和脱敏过滤的会话消息中提取问题、异议、期望结果和购买信号。每条洞察必须引用输入中的消息和会话 ID，不得还原个人信息。", input);
-    },
-    contentBrief(input) {
-      const context = (input as { brain_context?: MarketingPromptContext }).brain_context;
-      return generate(ContentBriefProposalSchema, "content_brief", "根据已接受洞察生成一份朋友圈优先的内容 Brief。固定目标客户、阶段、主角度、关键事实、证明需求、唯一 CTA 和截止时间。", input, model, context ? `code-${MARKETING_PROMPT_HASHES.content_brief}` : PROMPT_VERSION, context ? buildMarketingPrompt("content_brief", context) : SYSTEM_BOUNDARY);
-    },
-    weeklyRetrospective(input) {
-      return generate(WeeklyRetrospectiveSchema, "weekly_retrospective", "分开复盘平台互动与销售业务结果，提出下周主题候选，并始终声明时间关联不代表因果。", input);
-    },
+    id: "connection-openai", revision: 1, updated_at: new Date().toISOString(), tenant_id: "tenant-dogfood-cn", name: "OpenAI 官方云", provider: "openai", endpoint_scope: "public_cloud", protocol: "openai_responses", base_url: "https://api.openai.com/v1", region: "global", auth_mode: "bearer", credential_source: source, credential_ref: "OPENAI_API_KEY", credential_available: source !== "none",
+    capabilities: { structured_output: source !== "none", native_json_schema: source !== "none", refusal_signal: source !== "none", usage_reporting: source !== "none", request_id: source !== "none", tested_at: source !== "none" ? new Date().toISOString() : null, notes: ["OpenAI Responses Structured Outputs"] },
+    last_tested_at: source !== "none" ? new Date().toISOString() : null, last_error_code: null, created_by: "系统迁移",
   };
+}
+
+function openAiProfile(model: string, fallbackModel: string): ModelProfileVersion {
+  return {
+    id: "model-profile-openai", revision: 1, updated_at: new Date().toISOString(), tenant_id: "tenant-dogfood-cn", name: "OpenAI 全局主模型", connection_profile_id: "connection-openai", provider: "openai", protocol: "openai_responses", endpoint_scope: "public_cloud", primary_model: model, fallback_model: fallbackModel, status: "active", smoke_passed_at: null, smoke_case_count: 0, holdout_run_id: null, data_egress_acknowledged_by: "环境配置", data_egress_acknowledged_at: new Date().toISOString(), activated_by: "环境配置", activated_at: new Date().toISOString(), previous_profile_id: null, created_by: "系统迁移",
+  };
+}
+
+interface ActiveRuntime {
+  connection: ProviderConnectionProfile;
+  profile: ModelProfileVersion;
+  adapter: ProviderAdapter | null;
+  source: AiConfigurationSource;
+  configuredAt: string | null;
 }
 
 export function createOpenAiServiceManager(options: {
   apiKey?: string;
   model?: string;
   fastModel?: string;
+  environment?: NodeJS.ProcessEnv;
+  endpointAllowlist?: string[];
   verify?: (apiKey: string, model: string) => Promise<void>;
+  adapterFactory?: (options: ProviderAdapterOptions) => ProviderAdapter;
 } = {}): ConfigurableAiService {
-  const environmentApiKey = options.apiKey?.trim() || "";
+  const environment = options.environment ?? process.env;
+  const environmentApiKey = options.apiKey?.trim() || environment.OPENAI_API_KEY?.trim() || "";
   const environmentModel = options.model?.trim() || "gpt-5.6";
-  const environmentFastModel = options.fastModel?.trim() || "gpt-5.6-terra";
-  const verify = options.verify ?? verifyOpenAiConfiguration;
-  let fastModelAvailable = true;
-  let current = createOpenAiService({ apiKey: environmentApiKey, model: environmentModel, fastModel: environmentFastModel, fastModelAvailable });
-  let source: AiConfigurationSource = environmentApiKey ? "environment" : "none";
-  let configuredAt: string | null = environmentApiKey ? new Date().toISOString() : null;
+  const environmentFallbackModel = options.fastModel?.trim() || "gpt-5.6-terra";
+  const endpointAllowlist = options.endpointAllowlist ?? (environment.AI_ENDPOINT_ALLOWLIST ?? "").split(",").map((item) => item.trim()).filter(Boolean);
+  const adapterFactory = options.adapterFactory ?? createProviderAdapter;
+  const runtimeSecrets = new Map<string, string>();
+  const envConnection = openAiConnection(environmentApiKey ? "environment" : "none");
+  const envProfile = openAiProfile(environmentModel, environmentFallbackModel);
+  let active: ActiveRuntime = {
+    connection: envConnection,
+    profile: envProfile,
+    adapter: environmentApiKey ? adapterFactory({ connection: envConnection, apiKey: environmentApiKey, endpointAllowlist }) : null,
+    source: environmentApiKey ? "environment" : "none",
+    configuredAt: environmentApiKey ? new Date().toISOString() : null,
+  };
 
-  function configuration(): AiConfiguration {
-    return { configured: current.configured, model: current.model, fast_model: current.fastModel ?? environmentFastModel, fast_model_available: fastModelAvailable, source, configured_at: configuredAt };
+  function credential(connection: ProviderConnectionProfile, supplied?: string) {
+    if (connection.auth_mode === "none") return "";
+    if (supplied?.trim()) return supplied.trim();
+    const runtime = runtimeSecrets.get(connection.id);
+    if (runtime) return runtime;
+    if (connection.credential_ref && environment[connection.credential_ref]?.trim()) return environment[connection.credential_ref]!.trim();
+    return "";
   }
 
-  return {
-    get configured() { return current.configured; },
-    get model() { return current.model; },
-    get fastModel() { return current.fastModel; },
+  function configuration(): AiConfiguration {
+    const fallback = active.profile.fallback_model;
+    return {
+      configured: Boolean(active.adapter), provider: active.profile.provider, protocol: active.profile.protocol, endpoint_scope: active.profile.endpoint_scope,
+      connection_profile_id: active.connection.id, model_profile_version_id: active.profile.id, model: active.profile.primary_model, fallback_model: fallback,
+      fast_model: fallback ?? active.profile.primary_model, fast_model_available: Boolean(fallback && active.adapter), source: active.source, configured_at: active.configuredAt,
+    };
+  }
+
+  async function generate<T>(schema: ZodType<T>, schemaName: string, task: string, input: unknown, promptVersion = PROMPT_VERSION, systemPrompt = SYSTEM_BOUNDARY, validate?: (data: T) => void): Promise<AiResult<T>> {
+    if (!active.adapter) throw new AiServiceError(503, "AI_NOT_CONFIGURED", "当前全局模型 Profile 缺少可用凭据。", false);
+    const requestRecord = input && typeof input === "object" && !Array.isArray(input) ? input as Record<string, unknown> : null;
+    const idempotencyKey = typeof requestRecord?.__idempotency_key === "string" ? requestRecord.__idempotency_key : undefined;
+    const modelInput = requestRecord && "__idempotency_key" in requestRecord ? Object.fromEntries(Object.entries(requestRecord).filter(([key]) => key !== "__idempotency_key")) : input;
+    const fingerprint = crypto.createHash("sha256").update(JSON.stringify(modelInput)).digest("hex").slice(0, 16);
+    const startedAt = Date.now();
+    const run = async (model: string) => {
+      const result = await active.adapter!.generate({ schema, schemaName, systemPrompt, taskPrompt: task, input: modelInput, model, idempotencyKey });
+      validate?.(result.data);
+      return result;
+    };
+    let result;
+    let attempts = 1;
+    let routeReason = "global_primary";
+    let fallbackFrom: string | null = null;
+    try { result = await run(active.profile.primary_model); }
+    catch (cause) {
+      const error = asAiServiceError(cause);
+      if (!active.profile.fallback_model || !shouldFallback(error)) throw error;
+      attempts = 2;
+      routeReason = `global_fallback:${error.code}`;
+      fallbackFrom = active.profile.primary_model;
+      try { result = await run(active.profile.fallback_model); }
+      catch (fallbackError) { throw asAiServiceError(fallbackError); }
+    }
+    const meta: AiMeta = {
+      model: fallbackFrom ? active.profile.fallback_model! : active.profile.primary_model,
+      provider: active.profile.provider, protocol: active.profile.protocol, endpoint_scope: active.profile.endpoint_scope,
+      connection_profile_id: active.connection.id, model_profile_version_id: active.profile.id,
+      response_id: result.responseId, prompt_version: promptVersion, generated_at: new Date().toISOString(), router_version: ROUTER_VERSION, route_reason: routeReason,
+      attempts, latency_ms: Date.now() - startedAt, input_tokens: result.inputTokens, output_tokens: result.outputTokens, escalated_from: fallbackFrom, fallback_from: fallbackFrom, input_fingerprint: fingerprint,
+    };
+    return { data: result.data, meta };
+  }
+
+  const manager: ConfigurableAiService = {
+    get configured() { return Boolean(active.adapter); },
+    get model() { return active.profile.primary_model; },
+    get fastModel() { return active.profile.fallback_model ?? undefined; },
     getConfiguration: configuration,
     async configure(apiKey, model) {
-      const nextApiKey = apiKey.trim();
-      const nextModel = model.trim() || environmentModel;
-      await verify(nextApiKey, nextModel);
-      try {
-        await verify(nextApiKey, environmentFastModel);
-        fastModelAvailable = true;
-      } catch {
-        fastModelAvailable = false;
-      }
-      current = createOpenAiService({ apiKey: nextApiKey, model: nextModel, fastModel: environmentFastModel, fastModelAvailable });
-      source = "runtime";
-      configuredAt = new Date().toISOString();
+      const connection = openAiConnection("runtime");
+      const profile = openAiProfile(model.trim() || environmentModel, environmentFallbackModel);
+      if (options.verify) await options.verify(apiKey.trim(), profile.primary_model);
+      else await adapterFactory({ connection, apiKey: apiKey.trim(), endpointAllowlist }).verify(profile.primary_model);
+      runtimeSecrets.set(connection.id, apiKey.trim());
+      active = { connection, profile, adapter: adapterFactory({ connection, apiKey: apiKey.trim(), endpointAllowlist }), source: "runtime", configuredAt: new Date().toISOString() };
       return configuration();
     },
     resetRuntimeConfiguration() {
-      fastModelAvailable = true;
-      current = createOpenAiService({ apiKey: environmentApiKey, model: environmentModel, fastModel: environmentFastModel, fastModelAvailable });
-      source = environmentApiKey ? "environment" : "none";
-      configuredAt = environmentApiKey ? new Date().toISOString() : null;
+      runtimeSecrets.clear();
+      active = { connection: envConnection, profile: envProfile, adapter: environmentApiKey ? adapterFactory({ connection: envConnection, apiKey: environmentApiKey, endpointAllowlist }) : null, source: environmentApiKey ? "environment" : "none", configuredAt: environmentApiKey ? new Date().toISOString() : null };
       return configuration();
     },
-    weeklyStrategy(input) { return current.weeklyStrategy(input); },
-    contentDraft(input) { return current.contentDraft(input); },
-    riskReview(input) { return current.riskReview(input); },
-    customerEvaluation(input) { return current.customerEvaluation(input); },
-    conversationInsights(input) { return current.conversationInsights(input); },
-    contentBrief(input) { return current.contentBrief(input); },
-    weeklyRetrospective(input) { return current.weeklyRetrospective(input); },
+    async testConnection(connection, profile, apiKey) {
+      if (connection.id !== profile.connection_profile_id || connection.provider !== profile.provider || connection.protocol !== profile.protocol) throw new AiServiceError(422, "CAPABILITY_MISMATCH", "模型 Profile 与连接的供应商或协议不一致。", false);
+      try {
+        const key = credential(connection, apiKey);
+        const adapter = adapterFactory({ connection, apiKey: key, endpointAllowlist });
+        await adapter.verify(profile.primary_model);
+        if (apiKey?.trim()) runtimeSecrets.set(connection.id, apiKey.trim());
+        const now = new Date().toISOString();
+        return { structured_output: true, native_json_schema: connection.protocol !== "openai_chat", refusal_signal: true, usage_reporting: true, request_id: true, tested_at: now, notes: [connection.protocol === "openai_chat" ? "JSON 模式由 Zod 二次校验" : "原生 JSON Schema 已验证"] };
+      } catch (error) { throw asAiServiceError(error); }
+    },
+    async runSmoke(connection, profile) {
+      const key = credential(connection);
+      let adapter: ProviderAdapter;
+      try { adapter = adapterFactory({ connection, apiKey: key, endpointAllowlist }); }
+      catch (error) { throw asAiServiceError(error); }
+      const tasks = ["weekly_strategy", "content_brief", "content_draft", "customer_nba", "risk_review", "conversation_insights", "weekly_retrospective"];
+      let passed = 0;
+      for (let index = 0; index < tasks.length; index += 2) {
+        const batch = tasks.slice(index, index + 2).flatMap((task) => [task, task]).map(async (task, taskIndex) => {
+          await adapter.generate({ schema: ContentDraftProposalSchema.pick({ title: true }), schemaName: `smoke_${task}`, systemPrompt: "只返回符合 Schema 的 JSON。", taskPrompt: `连接 Smoke：返回一个非空 title，任务 ${task}。`, input: { synthetic: true, case: index * 2 + taskIndex + 1 }, model: profile.primary_model, idempotencyKey: `smoke-${profile.id}-${task}-${taskIndex}` });
+          passed += 1;
+        });
+        try { await Promise.all(batch); }
+        catch (error) { throw asAiServiceError(error); }
+      }
+      return { passed, total: 14 };
+    },
+    activateProfile(connection, profile) {
+      if (connection.id !== profile.connection_profile_id || connection.provider !== profile.provider || connection.protocol !== profile.protocol) throw new AiServiceError(422, "CAPABILITY_MISMATCH", "模型 Profile 与连接不匹配。", false);
+      const key = credential(connection);
+      try {
+        active = { connection, profile, adapter: adapterFactory({ connection, apiKey: key, endpointAllowlist }), source: runtimeSecrets.has(connection.id) ? "runtime" : connection.credential_ref && environment[connection.credential_ref] ? "environment" : "none", configuredAt: new Date().toISOString() };
+      } catch (error) { throw asAiServiceError(error); }
+      return configuration();
+    },
+    clearRuntimeSecret(connectionId) {
+      runtimeSecrets.delete(connectionId);
+      if (active.connection.id === connectionId) {
+        const key = credential(active.connection);
+        try { active.adapter = adapterFactory({ connection: active.connection, apiKey: key, endpointAllowlist }); }
+        catch { active.adapter = null; }
+        active.source = key ? "environment" : "none";
+        active.configuredAt = key ? new Date().toISOString() : null;
+      }
+      return configuration();
+    },
+    weeklyStrategy(input) {
+      const context = (input as { brain_context?: MarketingPromptContext }).brain_context;
+      return generate(WeeklyStrategySchema, "weekly_strategy", "根据当前经营指标、状态分布、内容和证明资产生成一周运营策略。配比总和必须为 100。", input, context ? `code-${MARKETING_PROMPT_HASHES.weekly_strategy}` : PROMPT_VERSION, context ? buildMarketingPrompt("weekly_strategy", context) : SYSTEM_BOUNDARY);
+    },
+    contentDraft(input) {
+      const context = (input as { brain_context?: MarketingPromptContext }).brain_context;
+      return generate(ContentDraftProposalSchema, "content_draft", "生成一条可人工编辑的朋友圈草稿，引用输入中存在的证据，并明确一个 CTA。", input, context ? `code-${MARKETING_PROMPT_HASHES.content_draft}` : PROMPT_VERSION, context ? buildMarketingPrompt("content_draft", context) : SYSTEM_BOUNDARY);
+    },
+    riskReview(input) { return generate(RiskReviewSchema, "risk_review", "检查事实、客户证明、量化承诺、价格、投诉和敏感信息风险；风险判断只是建议，不能解除确定性审批门禁。", input); },
+    customerEvaluation(input) {
+      const context = (input as { brain_context?: MarketingPromptContext }).brain_context;
+      const customer = (input as { customer?: Customer }).customer;
+      const task = `按以下顺序完成客户评估：
+1. 仅核对按时间排序且 valid=true 的证据，逐条给出可公开的 evidence_assessment。
+2. 判断状态是否保持或最多前进一步；弱信号不能独立推动 D1/A1，C1 必须引用成交事实。
+3. 从固定动作集合选择一个下一最佳动作，并列出不建议动作与未知项。
+4. 证据不足时 decision=insufficient_evidence、state_after=state_before，不得用高置信度掩盖缺口。`;
+      return generate(CustomerEvaluationSchema, "customer_evaluation", task, input, context ? `code-${MARKETING_PROMPT_HASHES.customer_nba}` : CUSTOMER_PROMPT_VERSION, context ? buildMarketingPrompt("customer_nba", context) : SYSTEM_BOUNDARY, (data) => {
+        if (data.confidence < 75) throw new AiServiceError(422, "LOW_CONFIDENCE", "模型置信度低于门槛。", true);
+        if (customer && !validateCustomerEvaluation(customer, data).allowed) throw new AiServiceError(422, "MODEL_POLICY_BLOCKED", "模型输出未通过确定性策略门禁。", true);
+      });
+    },
+    conversationInsights(input) { return generate(ConversationInsightsSchema, "conversation_insights", "从已经过同意、权限、有效性和脱敏过滤的会话消息中提取问题、异议、期望结果和购买信号。每条洞察必须引用输入中的消息和会话 ID，不得还原个人信息。", input); },
+    contentBrief(input) {
+      const context = (input as { brain_context?: MarketingPromptContext }).brain_context;
+      return generate(ContentBriefProposalSchema, "content_brief", "根据已接受洞察生成一份朋友圈优先的内容 Brief。固定目标客户、阶段、主角度、关键事实、证明需求、唯一 CTA 和截止时间。", input, context ? `code-${MARKETING_PROMPT_HASHES.content_brief}` : PROMPT_VERSION, context ? buildMarketingPrompt("content_brief", context) : SYSTEM_BOUNDARY);
+    },
+    weeklyRetrospective(input) { return generate(WeeklyRetrospectiveSchema, "weekly_retrospective", "分开复盘平台互动与销售业务结果，提出下周主题候选，并始终声明时间关联不代表因果。", input); },
   };
+  return manager;
+}
+
+export function createOpenAiService(options: { apiKey?: string; model?: string; fastModel?: string; fastModelAvailable?: boolean } = {}): AiService {
+  const manager = createOpenAiServiceManager({ apiKey: options.apiKey, model: options.model, fastModel: options.fastModel });
+  if (options.fastModelAvailable === false) {
+    const current = manager.getConfiguration();
+    const connection = openAiConnection(current.source);
+    const profile = { ...openAiProfile(current.model, current.model), fallback_model: null };
+    try { manager.activateProfile(connection, profile); } catch { /* missing keys remain blocked */ }
+  }
+  return manager;
 }

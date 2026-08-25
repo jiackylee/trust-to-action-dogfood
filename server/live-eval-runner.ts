@@ -16,6 +16,7 @@ interface StartLiveHoldoutInput {
   actor: string;
   marketingBrainVersionId: string;
   routerVersionId: string;
+  modelProfileVersionId?: string;
   idempotencyKey: string;
 }
 
@@ -132,19 +133,22 @@ export class LiveHoldoutRunner {
   ) {}
 
   start(input: StartLiveHoldoutInput) {
-    if (!this.aiService.configured) throw new AiServiceError(503, "AI_NOT_CONFIGURED", "真实 Holdout 需要先配置 OpenAI API Key。", false);
+    if (!this.aiService.configured) throw new AiServiceError(503, "AI_NOT_CONFIGURED", "真实 Holdout 需要当前全局模型 Profile 具备可用凭据。", false);
     const status = this.knowledgeService.status(input.tenantId);
     if (!status.active_version) throw new AiServiceError(422, "KNOWLEDGE_NOT_CONFIGURED", "真实 Holdout 需要已激活的知识包。", false);
     let runId = "";
     this.#update(input.tenantId, (state) => {
       const brain = state.marketing_brain_versions.find((item) => item.id === input.marketingBrainVersionId);
       const router = state.router_versions.find((item) => item.id === input.routerVersionId);
+      const modelProfile = input.modelProfileVersionId ? state.model_profiles.find((item) => item.id === input.modelProfileVersionId) : null;
       const facts = state.tenant_fact_versions.find((item) => item.id === brain?.tenant_fact_version_id && item.status === "published");
-      if (!brain || !router) throw new AiServiceError(404, "AI_VERSION_NOT_FOUND", "营销脑或路由版本不存在。", false);
+      if (!brain || !router || (input.modelProfileVersionId && !modelProfile)) throw new AiServiceError(404, "AI_VERSION_NOT_FOUND", "营销脑、模型 Profile 或兼容路由版本不存在。", false);
       if (!facts) throw new AiServiceError(422, "TENANT_FACTS_NOT_PUBLISHED", "营销脑绑定的企业事实未发布。", false);
       if (brain.knowledge_pack_version_id !== status.active_version?.id) throw new AiServiceError(409, "KNOWLEDGE_BINDING_MISMATCH", "营销脑未绑定当前激活知识包。", false);
       if (TASKS.some((task) => brain.prompt_hashes[task] !== MARKETING_PROMPT_HASHES[task])) throw new AiServiceError(409, "PROMPT_BINDING_MISMATCH", "营销脑未绑定当前代码化 Prompt，请先完成离线评测和发布。", false);
-      if (router.primary_model !== this.aiService.model || router.fast_model !== (this.aiService.fastModel ?? router.fast_model)) throw new AiServiceError(409, "ROUTER_BINDING_MISMATCH", "当前 BFF 模型配置与所选路由版本不一致。", false);
+      if (modelProfile) {
+        if (modelProfile.status !== "active" || modelProfile.primary_model !== this.aiService.model || brain.model_profile_version_id !== modelProfile.id) throw new AiServiceError(409, "MODEL_PROFILE_BINDING_MISMATCH", "当前全局模型与营销脑绑定不一致。", false);
+      } else if (router.primary_model !== this.aiService.model || router.fast_model !== (this.aiService.fastModel ?? router.fast_model)) throw new AiServiceError(409, "ROUTER_BINDING_MISMATCH", "当前 BFF 模型配置与所选路由版本不一致。", false);
       const cases = state.golden_cases.filter((item) => item.split === "holdout");
       if (cases.length !== 88) throw new AiServiceError(422, "HOLDOUT_SIZE_INVALID", `锁定 Holdout 应为 88 条，当前为 ${cases.length} 条。`, false);
       const existing = state.eval_runs.find((item) => item.mode === "live" && item.idempotency_key === input.idempotencyKey)
@@ -165,6 +169,7 @@ export class LiveHoldoutRunner {
         revision: 1,
         updated_at: startedAt,
         marketing_brain_version_id: brain.id,
+        model_profile_version_id: modelProfile?.id,
         router_version_id: router.id,
         split: "holdout",
         mode: "live",
@@ -356,7 +361,10 @@ export class LiveHoldoutRunner {
         revision: run.revision + 1,
         updated_at: completedAt,
       };
-      return { ...state, eval_runs: state.eval_runs.map((item) => item.id === run.id ? finished : item), audits: [{ id: `audit-${crypto.randomUUID()}`, actor: run.generated_by, action: "真实 Holdout 运行结束", detail: `${run.successful_count ?? 0}/${run.case_count} 条成功 · ${failed} 条失败 · ${finished.score?.passed ? "通过" : "未通过"}`, at: completedAt, source: "system" }, ...state.audits] };
+      const profiles = state.model_profiles.map((profile) => profile.id === run.model_profile_version_id && finished.score?.passed
+        ? { ...profile, status: profile.status === "active" ? "active" as const : "enterprise_ready" as const, holdout_run_id: run.id, revision: profile.revision + 1, updated_at: completedAt }
+        : profile);
+      return { ...state, model_profiles: profiles, eval_runs: state.eval_runs.map((item) => item.id === run.id ? finished : item), audits: [{ id: `audit-${crypto.randomUUID()}`, actor: run.generated_by, action: "真实 Holdout 运行结束", detail: `${run.successful_count ?? 0}/${run.case_count} 条成功 · ${failed} 条失败 · ${finished.score?.passed ? "通过" : "未通过"}`, at: completedAt, source: "system" }, ...state.audits] };
     });
   }
 

@@ -4,10 +4,10 @@ import { actorForRole, can, canAccessCustomer, canActOnTask, canViewRawConversat
 import { draftApprovalRisks, insightTrendScope, isMaterialDraftChange, proofCompleteness, proofIsUsable, validateCustomerEvaluation, validateInsightLineage } from "../domain/policy";
 import { candidateIsStale, evidenceFingerprint, scoreGoldenReplay } from "../domain/quality";
 import type { AiMeta, CustomerEvaluation, WeeklyRetrospective } from "../domain/schemas";
-import type { AnalysisBatch, ApiProblem, Approval, ContentBrief, ContentOutcome, ConversationInsight, DomainState, Draft, EvalRun, EvaluationCandidate, EvaluationDecision, EvaluationDecisionKind, EvaluationReasonCode, EvaluationReviewOutcome, GenerationRun, KnowledgePackVersion, KnowledgeRetrievalRun, KnowledgeSource, MarketingDecisionCandidate, MarketingDecisionDecision, MarketingDecisionKind, MarketingDecisionOutput, MarketingDecisionReasonCode, MarketingReviewOutcome, MarketingTaskType, NbaDecision, Proof, ProofCore, PublicationRecord, Role, Task } from "../domain/types";
+import type { AnalysisBatch, ApiProblem, Approval, ContentBrief, ContentOutcome, ConversationInsight, DomainState, Draft, EvalRun, EvaluationCandidate, EvaluationDecision, EvaluationDecisionKind, EvaluationReasonCode, EvaluationReviewOutcome, GenerationRun, KnowledgePackVersion, KnowledgeRetrievalRun, KnowledgeSource, MarketingDecisionCandidate, MarketingDecisionDecision, MarketingDecisionKind, MarketingDecisionOutput, MarketingDecisionReasonCode, MarketingReviewOutcome, MarketingTaskType, ModelProfileVersion, NbaDecision, Proof, ProofCore, ProviderCapability, ProviderConnectionProfile, PublicationRecord, Role, Task } from "../domain/types";
 
-const STORAGE_KEY = "trust-to-action-dogfood-v2-2";
-const FIXTURE_VERSION = 7;
+const STORAGE_KEY = "trust-to-action-dogfood-v2-3";
+const FIXTURE_VERSION = 8;
 
 export type NewProof = Omit<ProofCore, "completeness" | "missing_fields" | "referenced_by">;
 
@@ -107,6 +107,81 @@ export class StateDataClient implements DataClient {
   async #latency() { await this.#wait(); }
   async getState() { await this.#latency(); return structuredClone(this.#state); }
   async setRole(role: Role) { await this.#latency(); return this.#persist({ ...this.#state, role }); }
+
+  async createProviderConnection(connection: ProviderConnectionProfile) {
+    await this.#latency();
+    if (!can(this.#state.role, "configure_ai")) throw problem(403, "FORBIDDEN", "当前角色不能配置模型连接");
+    if (this.#state.provider_connections.some((item) => item.id === connection.id)) throw problem(409, "VERSION_CONFLICT", "模型连接 ID 已存在");
+    const audit = { id: id("audit"), actor: actorForRole(this.#state.role), action: "创建模型连接", detail: `${connection.name} · ${connection.provider} · ${connection.protocol}`, at: now(), source: "human" as const };
+    return this.#persist({ ...this.#state, provider_connections: [connection, ...this.#state.provider_connections], audits: [audit, ...this.#state.audits] });
+  }
+
+  async createModelProfile(profile: ModelProfileVersion) {
+    await this.#latency();
+    if (!can(this.#state.role, "configure_ai")) throw problem(403, "FORBIDDEN", "当前角色不能创建模型 Profile");
+    const connection = this.#state.provider_connections.find((item) => item.id === profile.connection_profile_id);
+    if (!connection) throw problem(404, "CONNECTION_NOT_FOUND", "模型连接不存在");
+    if (connection.provider !== profile.provider || connection.protocol !== profile.protocol) throw problem(422, "CAPABILITY_MISMATCH", "模型 Profile 与连接协议不一致");
+    const audit = { id: id("audit"), actor: actorForRole(this.#state.role), action: "创建模型 Profile", detail: `${profile.name} · ${profile.primary_model}`, at: now(), source: "human" as const };
+    return this.#persist({ ...this.#state, model_profiles: [profile, ...this.#state.model_profiles], audits: [audit, ...this.#state.audits] });
+  }
+
+  async recordConnectionTest(connectionId: string, capability: ProviderCapability, credentialSource: "environment" | "runtime" | "none", expectedRevision: number) {
+    await this.#latency();
+    if (!can(this.#state.role, "configure_ai")) throw problem(403, "FORBIDDEN", "当前角色不能测试模型连接");
+    const connection = this.#state.provider_connections.find((item) => item.id === connectionId);
+    if (!connection) throw problem(404, "CONNECTION_NOT_FOUND", "模型连接不存在");
+    if (connection.revision !== expectedRevision) throw problem(409, "VERSION_CONFLICT", "模型连接已更新", true, connection);
+    const testedAt = now();
+    const updated: ProviderConnectionProfile = { ...connection, capabilities: capability, credential_source: credentialSource, credential_available: connection.auth_mode === "none" || credentialSource !== "none", last_tested_at: testedAt, last_error_code: null, revision: connection.revision + 1, updated_at: testedAt };
+    const profiles = this.#state.model_profiles.map((item): ModelProfileVersion => item.connection_profile_id === connectionId && ["draft", "credential_missing"].includes(item.status) ? { ...item, status: "connection_verified", revision: item.revision + 1, updated_at: testedAt } : item);
+    const audit = { id: id("audit"), actor: actorForRole(this.#state.role), action: "验证模型连接", detail: `${connection.name} · Structured Output 可用`, at: testedAt, source: "human" as const };
+    return this.#persist({ ...this.#state, provider_connections: this.#state.provider_connections.map((item) => item.id === connectionId ? updated : item), model_profiles: profiles, audits: [audit, ...this.#state.audits] });
+  }
+
+  async clearConnectionCredential(connectionId: string) {
+    await this.#latency();
+    if (!can(this.#state.role, "configure_ai")) throw problem(403, "FORBIDDEN", "当前角色不能清除模型凭据");
+    const changedAt = now();
+    const connections = this.#state.provider_connections.map((item): ProviderConnectionProfile => item.id === connectionId
+      ? { ...item, credential_source: item.credential_ref ? "environment" : "none", credential_available: false, revision: item.revision + 1, updated_at: changedAt }
+      : item);
+    const profiles = this.#state.model_profiles.map((item): ModelProfileVersion => item.connection_profile_id === connectionId && item.status === "active" ? { ...item, status: "credential_missing", revision: item.revision + 1, updated_at: changedAt } : item);
+    return this.#persist({ ...this.#state, provider_connections: connections, model_profiles: profiles, audits: [{ id: id("audit"), actor: actorForRole(this.#state.role), action: "清除模型会话凭据", detail: connectionId, at: changedAt, source: "human" as const }, ...this.#state.audits] });
+  }
+
+  async markModelProfileSmoke(profileId: string, expectedRevision: number) {
+    await this.#latency();
+    if (!can(this.#state.role, "configure_ai")) throw problem(403, "FORBIDDEN", "当前角色不能运行模型 Smoke");
+    const profile = this.#state.model_profiles.find((item) => item.id === profileId);
+    if (!profile) throw problem(404, "PROFILE_NOT_FOUND", "模型 Profile 不存在");
+    if (profile.revision !== expectedRevision) throw problem(409, "VERSION_CONFLICT", "模型 Profile 已更新", true, profile);
+    const testedAt = now();
+    const updated: ModelProfileVersion = { ...profile, status: "trial_ready", smoke_passed_at: testedAt, smoke_case_count: 14, revision: profile.revision + 1, updated_at: testedAt };
+    return this.#persist({ ...this.#state, model_profiles: this.#state.model_profiles.map((item) => item.id === profileId ? updated : item), audits: [{ id: id("audit"), actor: actorForRole(this.#state.role), action: "完成模型 Smoke", detail: `${profile.name} · 14/14`, at: testedAt, source: "ai" as const }, ...this.#state.audits] });
+  }
+
+  async activateModelProfile(profileId: string, expectedRevision: number, dataEgressAcknowledged: boolean) {
+    await this.#latency();
+    if (this.#state.role !== "lead") throw problem(403, "FORBIDDEN", "只有负责人可以激活全局模型 Profile");
+    const profile = this.#state.model_profiles.find((item) => item.id === profileId);
+    if (!profile) throw problem(404, "PROFILE_NOT_FOUND", "模型 Profile 不存在");
+    if (profile.revision !== expectedRevision) throw problem(409, "VERSION_CONFLICT", "模型 Profile 已更新", true, profile);
+    if (!["trial_ready", "enterprise_ready", "active"].includes(profile.status)) throw problem(422, "SMOKE_REQUIRED", "模型 Profile 必须先通过 14 条 Smoke");
+    if (profile.endpoint_scope === "public_cloud" && !dataEgressAcknowledged) throw problem(422, "DATA_EGRESS_ACK_REQUIRED", "激活公有云模型前必须确认数据去向");
+    const activatedAt = now();
+    const current = this.#state.model_profiles.find((item) => item.status === "active" && item.id !== profileId);
+    const profiles = this.#state.model_profiles.map((item): ModelProfileVersion => {
+      if (item.id === profileId) return { ...item, status: "active", previous_profile_id: current?.id ?? item.previous_profile_id, data_egress_acknowledged_by: profile.endpoint_scope === "public_cloud" ? actorForRole(this.#state.role) : item.data_egress_acknowledged_by, data_egress_acknowledged_at: profile.endpoint_scope === "public_cloud" ? activatedAt : item.data_egress_acknowledged_at, activated_by: actorForRole(this.#state.role), activated_at: activatedAt, revision: item.revision + 1, updated_at: activatedAt };
+      if (item.status === "active") return { ...item, status: item.holdout_run_id ? "enterprise_ready" : "trial_ready", revision: item.revision + 1, updated_at: activatedAt };
+      return item;
+    });
+    const candidates = this.#state.marketing_candidates.map((item): MarketingDecisionCandidate => item.status === "pending" ? { ...item, status: "stale", revision: item.revision + 1, updated_at: activatedAt } : item);
+    const evaluationCandidates = this.#state.evaluation_candidates.map((item): EvaluationCandidate => item.status === "pending" ? { ...item, status: "stale", revision: item.revision + 1, updated_at: activatedAt } : item);
+    const brains = this.#state.marketing_brain_versions.map((item) => item.status === "published" ? { ...item, model_profile_version_id: profileId, revision: item.revision + 1, updated_at: activatedAt } : item);
+    const audit = { id: id("audit"), actor: actorForRole(this.#state.role), action: "激活全局模型 Profile", detail: `${profile.provider} · ${profile.primary_model} · 待处理候选已过期`, at: activatedAt, source: "human" as const };
+    return this.#persist({ ...this.#state, model_profiles: profiles, marketing_brain_versions: brains, marketing_candidates: candidates, evaluation_candidates: evaluationCandidates, audits: [audit, ...this.#state.audits] });
+  }
 
   async syncKnowledgeCatalog(versions: KnowledgePackVersion[], sources: KnowledgeSource[], retrievalRuns: KnowledgeRetrievalRun[], promptHashes?: Record<MarketingTaskType, string>) {
     await this.#latency();
@@ -231,7 +306,7 @@ export class StateDataClient implements DataClient {
     const previous = this.#state.evaluation_candidates.map((item): EvaluationCandidate => item.customer_id === customer.id && item.status === "pending"
       ? { ...item, status: "stale", revision: item.revision + 1, updated_at: savedAt }
       : item);
-    const audit = { id: id("audit"), actor: "OpenAI", action: "生成客户评估候选", detail: `${customer.name} · ${candidate.evaluation.state_before} → ${candidate.evaluation.state_after} · ${candidate.evaluation.recommendation} · ${run.model}`, at: savedAt, source: "ai" as const };
+    const audit = { id: id("audit"), actor: run.provider ?? "AI", action: "生成客户评估候选", detail: `${customer.name} · ${candidate.evaluation.state_before} → ${candidate.evaluation.state_after} · ${candidate.evaluation.recommendation} · ${run.model}`, at: savedAt, source: "ai" as const };
     return this.#persist({ ...this.#state, generation_runs: [run, ...this.#state.generation_runs], evaluation_candidates: [candidate, ...previous], audits: [audit, ...this.#state.audits] });
   }
 
@@ -240,7 +315,7 @@ export class StateDataClient implements DataClient {
     if (!can(this.#state.role, "evaluate_customer")) throw problem(403, "FORBIDDEN", "当前角色不能记录客户评估运行");
     const customer = this.#state.customers.find((item) => item.id === run.subject_id);
     if (!customer || !canAccessCustomer(this.#state.role, customer)) throw problem(404, "NOT_FOUND", "客户不存在或不在当前可见范围");
-    const audit = { id: id("audit"), actor: "OpenAI", action: run.status === "blocked" ? "客户评估被策略阻断" : "客户评估生成失败", detail: `${customer.name} · ${run.model} · ${run.error_code ?? "UNKNOWN"}`, at: run.created_at, source: "ai" as const };
+    const audit = { id: id("audit"), actor: run.provider ?? "AI", action: run.status === "blocked" ? "客户评估被策略阻断" : "客户评估生成失败", detail: `${customer.name} · ${run.model} · ${run.error_code ?? "UNKNOWN"}`, at: run.created_at, source: "ai" as const };
     return this.#persist({ ...this.#state, generation_runs: [run, ...this.#state.generation_runs], audits: [audit, ...this.#state.audits] });
   }
 
@@ -321,7 +396,7 @@ export class StateDataClient implements DataClient {
     const previous = this.#state.marketing_candidates.map((item): MarketingDecisionCandidate => item.task_type === candidate.task_type && item.subject_id === candidate.subject_id && item.status === "pending"
       ? { ...item, status: "stale", revision: item.revision + 1, updated_at: savedAt }
       : item);
-    const audit = { id: id("audit"), actor: "OpenAI", action: "生成营销决策候选", detail: `${candidate.task_type} · ${candidate.subject_id} · ${candidate.envelope.knowledge_refs.length} 条知识引用`, at: savedAt, source: "ai" as const };
+    const audit = { id: id("audit"), actor: candidate.envelope.ai_meta.provider ?? "AI", action: "生成营销决策候选", detail: `${candidate.task_type} · ${candidate.subject_id} · ${candidate.envelope.knowledge_refs.length} 条知识引用`, at: savedAt, source: "ai" as const };
     return this.#persist({ ...this.#state, marketing_candidates: [candidate, ...previous], audits: [audit, ...this.#state.audits] });
   }
 
